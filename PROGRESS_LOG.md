@@ -26,18 +26,20 @@
 - [x] WAV integration tests (4 tests: f32 round-trip, i16 quantization, 44100 Hz, streaming embed)
 - [x] Criterion benchmarks (embed, detect, streaming, FFT)
 
-### Phase 5: Robustness — NOT STARTED
-- [ ] MP3/AAC round-trip robustness tests
-- [ ] Parameter tuning
-- [ ] Optional rayon parallelism
+### Phase 5: Robustness, Parallelism & Licensing — COMPLETE
+- [x] LICENSE-MIT and LICENSE-APACHE files added
+- [x] `WatermarkConfig::robust()` constructor (strength 0.05 for lossy codec survival)
+- [x] MP3/AAC/Opus round-trip robustness tests (8 tests, `#[ignore]`, require ffmpeg)
+- [x] Parameter tuning sweep test (`#[ignore]`, strength x codec matrix)
+- [x] Optional rayon parallelism (`parallel` feature: `embed_parallel`, `detect_parallel`)
+- [x] Parallel benchmarks (embed + detect)
 
 ### Outstanding Issues
-- [ ] 2 clippy warnings (codec.rs needless range loop, stream.rs collapsible if)
-- [ ] No LICENSE-MIT / LICENSE-APACHE files
 - [ ] No git commits yet — entire project is untracked
 
 ### Test Summary
-- **44/44 tests passing** (40 unit + 4 WAV integration)
+- **47/47 tests passing** (40 unit + 3 parallel + 4 WAV integration)
+- 9 additional `#[ignore]` tests (lossy codec round-trips + parameter tuning, require ffmpeg)
 - All modules have unit tests
 - CLI verified working end-to-end (embed + detect with broadband audio)
 
@@ -52,14 +54,14 @@
 
 Conclusion: **easily real-time capable** — thousands of times faster than real-time for both embedding and detection.
 
-### Files Implemented (13 .rs source + 2 test/bench)
+### Files Implemented (14 .rs source + 4 test/bench)
 | Module | Tests | Status |
 |--------|-------|--------|
 | lib.rs | — | Public API re-exports |
 | error.rs | — | Error types |
 | key.rs | 6 | AES-PRNG bin selection |
 | fft.rs | 3 | realfft wrapper |
-| config.rs | — | Configuration |
+| config.rs | — | Configuration + `robust()` |
 | payload.rs | 5 | 128-bit payload + CRC |
 | patchwork.rs | 5 | Core embed/detect per frame |
 | codec.rs | 7 | Conv. encoder + Viterbi |
@@ -68,5 +70,8 @@ Conclusion: **easily real-time capable** — thousands of times faster than real
 | embed.rs | 3 | Embedding pipeline |
 | detect.rs | 3 | Detection pipeline |
 | stream.rs | 1 | Streaming wrappers |
+| parallel.rs | 3 | Rayon parallel embed/detect (feature-gated) |
 | tests/wav_round_trip.rs | 4 | WAV file integration tests |
-| benches/throughput.rs | 5 | Criterion benchmarks |
+| tests/lossy_codec_round_trip.rs | 8 | MP3/AAC/Opus robustness (ignored) |
+| tests/parameter_tuning.rs | 1 | Strength x codec sweep (ignored) |
+| benches/throughput.rs | 5+2 | Criterion benchmarks (+ parallel) |

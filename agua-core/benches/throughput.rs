@@ -105,6 +105,42 @@ fn bench_stream_detect(c: &mut Criterion) {
     });
 }
 
+#[cfg(feature = "parallel")]
+fn bench_parallel_embed(c: &mut Criterion) {
+    let config = WatermarkConfig::default();
+    let key = WatermarkKey::new(&[42u8; 16]).unwrap();
+    let payload = Payload::new([0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+    let audio = make_test_audio(48000, config.sample_rate);
+
+    c.bench_function("parallel_embed_1s_48khz", |b| {
+        b.iter(|| {
+            let mut samples = audio.clone();
+            agua_core::embed_parallel(black_box(&mut samples), &payload, &key, &config).unwrap();
+        });
+    });
+}
+
+#[cfg(feature = "parallel")]
+fn bench_parallel_detect(c: &mut Criterion) {
+    let config = WatermarkConfig {
+        strength: 0.03,
+        ..WatermarkConfig::default()
+    };
+    let key = WatermarkKey::new(&[42u8; 16]).unwrap();
+    let payload = Payload::new([0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+    let num_samples = 48000 * 22;
+    let mut audio = make_test_audio(num_samples, config.sample_rate);
+    agua_core::embed(&mut audio, &payload, &key, &config).unwrap();
+
+    c.bench_function("parallel_detect_22s_48khz", |b| {
+        b.iter(|| {
+            agua_core::detect_parallel(black_box(&audio), &key, &config).unwrap();
+        });
+    });
+}
+
 fn bench_fft_frame(c: &mut Criterion) {
     let config = WatermarkConfig::default();
     let audio = make_test_audio(config.frame_size, config.sample_rate);
@@ -121,6 +157,7 @@ fn bench_fft_frame(c: &mut Criterion) {
     });
 }
 
+#[cfg(not(feature = "parallel"))]
 criterion_group!(
     benches,
     bench_embed,
@@ -129,4 +166,17 @@ criterion_group!(
     bench_stream_detect,
     bench_fft_frame,
 );
+
+#[cfg(feature = "parallel")]
+criterion_group!(
+    benches,
+    bench_embed,
+    bench_detect,
+    bench_stream_embed,
+    bench_stream_detect,
+    bench_fft_frame,
+    bench_parallel_embed,
+    bench_parallel_detect,
+);
+
 criterion_main!(benches);

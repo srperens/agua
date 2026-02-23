@@ -30,6 +30,17 @@ impl Default for WatermarkConfig {
 }
 
 impl WatermarkConfig {
+    /// Configuration tuned for robustness against lossy codecs (MP3, AAC, Opus).
+    ///
+    /// Uses higher embedding strength (`0.05`) to survive lossy compression.
+    /// The watermark will be slightly more audible but significantly more robust.
+    pub fn robust() -> Self {
+        Self {
+            strength: 0.05,
+            ..Self::default()
+        }
+    }
+
     /// Number of complex frequency bins (frame_size / 2 + 1).
     pub fn num_bins(&self) -> usize {
         self.frame_size / 2 + 1

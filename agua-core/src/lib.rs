@@ -11,6 +11,9 @@ pub mod payload;
 pub mod stream;
 pub mod sync;
 
+#[cfg(feature = "parallel")]
+pub mod parallel;
+
 // Re-export primary API types
 pub use config::WatermarkConfig;
 pub use embed::DetectionResult;
@@ -18,6 +21,9 @@ pub use error::Error;
 pub use key::WatermarkKey;
 pub use payload::Payload;
 pub use stream::{StreamDetector, StreamEmbedder};
+
+#[cfg(feature = "parallel")]
+pub use parallel::{detect_parallel, embed_parallel};
 
 /// Embed a watermark into audio samples (in-place).
 ///
