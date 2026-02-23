@@ -1,0 +1,3 @@
+[workspace]
+members = ["agua-core", "agua-cli"]
+resolver = "3"

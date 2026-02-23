@@ -1,0 +1,15 @@
+[package]
+name = "agua-cli"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "CLI for agua audio watermarking"
+
+[[bin]]
+name = "agua"
+path = "src/main.rs"
+
+[dependencies]
+agua-core = { path = "../agua-core" }
+clap = { version = "4", features = ["derive"] }
+hound = "3.5"

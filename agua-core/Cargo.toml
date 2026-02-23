@@ -1,0 +1,15 @@
+[package]
+name = "agua-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Audio watermarking library using patchwork algorithm in FFT domain"
+
+[dependencies]
+realfft = "3.5"
+aes = "0.8"
+cipher = "0.5"
+thiserror = "2"
+
+[dev-dependencies]
+hound = "3.5"

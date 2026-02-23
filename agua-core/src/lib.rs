@@ -1,0 +1,45 @@
+pub mod codec;
+pub mod config;
+pub mod detect;
+pub mod embed;
+pub mod error;
+pub mod fft;
+pub mod frame;
+pub mod key;
+pub mod patchwork;
+pub mod payload;
+pub mod stream;
+pub mod sync;
+
+// Re-export primary API types
+pub use config::WatermarkConfig;
+pub use embed::DetectionResult;
+pub use error::Error;
+pub use key::WatermarkKey;
+pub use payload::Payload;
+pub use stream::{StreamDetector, StreamEmbedder};
+
+/// Embed a watermark into audio samples (in-place).
+///
+/// This is the one-shot API for file-based workflows.
+/// For streaming/real-time use, see [`StreamEmbedder`].
+pub fn embed(
+    samples: &mut [f32],
+    payload: &Payload,
+    key: &WatermarkKey,
+    config: &WatermarkConfig,
+) -> error::Result<()> {
+    embed::embed(samples, payload, key, config)
+}
+
+/// Detect watermarks in audio samples.
+///
+/// Returns all successfully detected watermark payloads.
+/// For streaming/real-time use, see [`StreamDetector`].
+pub fn detect(
+    samples: &[f32],
+    key: &WatermarkKey,
+    config: &WatermarkConfig,
+) -> error::Result<Vec<DetectionResult>> {
+    detect::detect(samples, key, config)
+}

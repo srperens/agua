@@ -1,0 +1,8 @@
+/target
+.env
+*.pem
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
