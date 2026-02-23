@@ -19,6 +19,20 @@ pub fn embed(
     key: &WatermarkKey,
     config: &WatermarkConfig,
 ) -> Result<()> {
+    embed_with_offset(samples, payload, key, config, 0)
+}
+
+/// Embed a watermark into audio samples (in-place) starting at a frame offset.
+///
+/// `frame_offset` specifies the absolute frame index of `samples[0]` in the
+/// original stream, ensuring PRNG bin selection aligns across segments.
+pub fn embed_with_offset(
+    samples: &mut [f32],
+    payload: &Payload,
+    key: &WatermarkKey,
+    config: &WatermarkConfig,
+    frame_offset: u32,
+) -> Result<()> {
     let frame_size = config.frame_size;
     if samples.len() < frame_size {
         return Err(Error::AudioTooShort {
@@ -44,7 +58,8 @@ pub fn embed(
 
     for frame_idx in 0..num_frames {
         let offset = frame_idx * frame_size;
-        let bit_idx = frame_idx % block_len;
+        let global_frame = frame_offset as usize + frame_idx;
+        let bit_idx = global_frame % block_len;
         let bit = block_bits[bit_idx];
 
         // Copy frame into buffer
@@ -52,7 +67,7 @@ pub fn embed(
 
         // FFT → modify bins → IFFT → replace frame
         fft.forward(&mut buf)?;
-        patchwork::embed_frame(fft.freq_bins_mut(), bit, key, frame_idx as u32, config);
+        patchwork::embed_frame(fft.freq_bins_mut(), bit, key, global_frame as u32, config);
         fft.inverse(&mut buf)?;
         fft.normalize(&mut buf);
 

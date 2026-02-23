@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -31,6 +31,30 @@ enum Command {
         /// Embedding strength (0.001 - 0.1)
         #[arg(short, long, default_value = "0.01")]
         strength: f32,
+
+        /// Parameter profile
+        #[arg(long, value_enum)]
+        profile: Option<Profile>,
+
+        /// Delay before embedding starts (seconds)
+        #[arg(long, default_value = "0")]
+        offset_seconds: f32,
+
+        /// FFT frame size (power of 2)
+        #[arg(long, default_value = "1024")]
+        frame_size: usize,
+
+        /// Number of bin pairs per frame
+        #[arg(long, default_value = "200")]
+        num_bin_pairs: usize,
+
+        /// Minimum FFT bin index
+        #[arg(long, default_value = "5")]
+        min_bin: usize,
+
+        /// Maximum FFT bin index
+        #[arg(long, default_value = "500")]
+        max_bin: usize,
     },
     /// Detect a watermark in a WAV file
     Detect {
@@ -41,7 +65,54 @@ enum Command {
         /// Key passphrase
         #[arg(short, long, default_value = "agua-default-key")]
         key: String,
+
+        /// Parameter profile
+        #[arg(long, value_enum)]
+        profile: Option<Profile>,
+
+        /// Start offset for detection (seconds)
+        #[arg(long, default_value = "0")]
+        offset_seconds: f32,
+
+        /// FFT frame size (power of 2)
+        #[arg(long, default_value = "1024")]
+        frame_size: usize,
+
+        /// Number of bin pairs per frame
+        #[arg(long, default_value = "200")]
+        num_bin_pairs: usize,
+
+        /// Minimum FFT bin index
+        #[arg(long, default_value = "5")]
+        min_bin: usize,
+
+        /// Maximum FFT bin index
+        #[arg(long, default_value = "500")]
+        max_bin: usize,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum Profile {
+    Music,
+}
+
+fn apply_profile(
+    profile: Option<Profile>,
+    strength: &mut f32,
+    num_bin_pairs: &mut usize,
+    min_bin: &mut usize,
+    max_bin: &mut usize,
+) {
+    match profile {
+        Some(Profile::Music) => {
+            *strength = 0.05;
+            *num_bin_pairs = 50;
+            *min_bin = 5;
+            *max_bin = 300;
+        }
+        None => {}
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -53,8 +124,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             output,
             payload,
             key,
-            strength,
+            mut strength,
+            profile,
+            offset_seconds,
+            frame_size,
+            mut num_bin_pairs,
+            mut min_bin,
+            mut max_bin,
         } => {
+            if !frame_size.is_power_of_two() {
+                return Err(format!("frame_size must be power of 2, got {frame_size}").into());
+            }
+            apply_profile(profile, &mut strength, &mut num_bin_pairs, &mut min_bin, &mut max_bin);
             let reader = hound::WavReader::open(&input)?;
             let spec = reader.spec();
 
@@ -94,8 +175,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let config = agua_core::WatermarkConfig {
                 sample_rate: spec.sample_rate,
                 strength,
+                frame_size,
+                num_bin_pairs,
+                min_bin,
+                max_bin,
                 ..Default::default()
             };
+            let num_bins = config.num_bins();
+            if config.min_bin >= num_bins || config.max_bin >= num_bins {
+                eprintln!(
+                    "Warning: bin range [{}, {}] exceeds available bins (0..{}). Consider lowering min/max bin.",
+                    config.min_bin,
+                    config.max_bin,
+                    num_bins - 1
+                );
+            }
 
             eprintln!(
                 "Embedding watermark into {} ({} samples, {}Hz)...",
@@ -104,7 +198,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 spec.sample_rate
             );
 
-            agua_core::embed(&mut samples, &wm_payload, &wm_key, &config)?;
+            let frames_per_block = agua_core::sync::frames_per_block();
+            let total_frames = samples.len() / config.frame_size;
+            let offset_samples = (offset_seconds * config.sample_rate as f32).round() as usize;
+            let offset_frames = offset_samples / config.frame_size;
+            let effective_offset = offset_frames * config.frame_size;
+            if effective_offset >= samples.len() {
+                return Err(format!(
+                    "offset_seconds too large: {}s exceeds audio length",
+                    offset_seconds
+                )
+                .into());
+            }
+            if effective_offset != offset_samples {
+                eprintln!(
+                    "Warning: offset aligned to frame boundary ({} samples ≈ {:.3}s).",
+                    effective_offset,
+                    effective_offset as f32 / config.sample_rate as f32
+                );
+            }
+            let num_frames = total_frames.saturating_sub(offset_frames);
+            if num_frames < frames_per_block {
+                let needed_samples = frames_per_block * config.frame_size;
+                let needed_seconds = needed_samples as f32 / config.sample_rate as f32;
+                eprintln!(
+                    "Warning: audio is too short for reliable detection ({} frames, need {}). Minimum duration ≈ {:.2}s at {}Hz.",
+                    num_frames,
+                    frames_per_block,
+                    needed_seconds,
+                    config.sample_rate
+                );
+            }
+
+            let start = effective_offset;
+            let frame_offset = offset_frames as u32;
+            agua_core::embed_with_offset(&mut samples[start..], &wm_payload, &wm_key, &config, frame_offset)?;
 
             // Write output WAV
             let out_spec = hound::WavSpec {
@@ -122,7 +250,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Watermarked audio written to {}", output.display());
             println!("Payload: {}", wm_payload.to_hex());
         }
-        Command::Detect { input, key } => {
+        Command::Detect {
+            input,
+            key,
+            profile,
+            offset_seconds,
+            frame_size,
+            mut num_bin_pairs,
+            mut min_bin,
+            mut max_bin,
+        } => {
+            if !frame_size.is_power_of_two() {
+                return Err(format!("frame_size must be power of 2, got {frame_size}").into());
+            }
+            let mut strength = 0.01;
+            apply_profile(profile, &mut strength, &mut num_bin_pairs, &mut min_bin, &mut max_bin);
             let reader = hound::WavReader::open(&input)?;
             let spec = reader.spec();
 
@@ -152,8 +294,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let wm_key = agua_core::WatermarkKey::from_passphrase(&key);
             let config = agua_core::WatermarkConfig {
                 sample_rate: spec.sample_rate,
+                strength,
+                frame_size,
+                num_bin_pairs,
+                min_bin,
+                max_bin,
                 ..Default::default()
             };
+            let num_bins = config.num_bins();
+            if config.min_bin >= num_bins || config.max_bin >= num_bins {
+                eprintln!(
+                    "Warning: bin range [{}, {}] exceeds available bins (0..{}). Consider lowering min/max bin.",
+                    config.min_bin,
+                    config.max_bin,
+                    num_bins - 1
+                );
+            }
 
             eprintln!(
                 "Detecting watermark in {} ({} samples, {}Hz)...",
@@ -162,13 +318,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 spec.sample_rate
             );
 
-            match agua_core::detect(&samples, &wm_key, &config) {
+            let frames_per_block = agua_core::sync::frames_per_block();
+            let total_frames = samples.len() / config.frame_size;
+            let offset_samples = (offset_seconds * config.sample_rate as f32).round() as usize;
+            let offset_frames = offset_samples / config.frame_size;
+            let effective_offset = offset_frames * config.frame_size;
+            if effective_offset >= samples.len() {
+                return Err(format!(
+                    "offset_seconds too large: {}s exceeds audio length",
+                    offset_seconds
+                )
+                .into());
+            }
+            if effective_offset != offset_samples {
+                eprintln!(
+                    "Warning: offset aligned to frame boundary ({} samples ≈ {:.3}s).",
+                    effective_offset,
+                    effective_offset as f32 / config.sample_rate as f32
+                );
+            }
+            let num_frames = total_frames.saturating_sub(offset_frames);
+            if num_frames < frames_per_block {
+                let needed_samples = frames_per_block * config.frame_size;
+                let needed_seconds = needed_samples as f32 / config.sample_rate as f32;
+                eprintln!(
+                    "Warning: audio is too short for reliable detection ({} frames, need {}). Minimum duration ≈ {:.2}s at {}Hz.",
+                    num_frames,
+                    frames_per_block,
+                    needed_seconds,
+                    config.sample_rate
+                );
+            }
+
+            let start = effective_offset;
+            let frame_offset = offset_frames as u32;
+            match agua_core::detect_with_offset(&samples[start..], &wm_key, &config, frame_offset) {
                 Ok(results) => {
                     for (i, r) in results.iter().enumerate() {
                         println!("Detection #{}", i + 1);
                         println!("  Payload:    {}", r.payload.to_hex());
                         println!("  Confidence: {:.4}", r.confidence);
                         println!("  Offset:     frame {}", r.offset);
+                        let offset_seconds =
+                            r.offset as f32 * config.frame_size as f32 / config.sample_rate as f32;
+                        println!("  Offset:     {:.3} s", offset_seconds);
                     }
                 }
                 Err(agua_core::Error::NotDetected) => {

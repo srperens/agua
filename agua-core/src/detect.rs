@@ -20,6 +20,19 @@ pub fn detect(
     key: &WatermarkKey,
     config: &WatermarkConfig,
 ) -> Result<Vec<DetectionResult>> {
+    detect_with_offset(samples, key, config, 0)
+}
+
+/// Detect watermarks in audio samples starting at a frame offset.
+///
+/// `frame_offset` specifies the absolute frame index of `samples[0]` in the
+/// original stream, ensuring PRNG bin selection aligns across segments.
+pub fn detect_with_offset(
+    samples: &[f32],
+    key: &WatermarkKey,
+    config: &WatermarkConfig,
+    frame_offset: u32,
+) -> Result<Vec<DetectionResult>> {
     let frame_size = config.frame_size;
     if samples.len() < frame_size {
         return Err(Error::AudioTooShort {
@@ -41,7 +54,8 @@ pub fn detect(
         let offset = frame_idx * frame_size;
         let mut buf = samples[offset..offset + frame_size].to_vec();
         fft.forward(&mut buf)?;
-        let soft = patchwork::detect_frame(fft.freq_bins(), key, frame_idx as u32, config);
+        let global_frame = frame_offset as usize + frame_idx;
+        let soft = patchwork::detect_frame(fft.freq_bins(), key, global_frame as u32, config);
         soft_values.push(soft);
     }
 
@@ -67,9 +81,8 @@ pub fn detect(
                     results.push(DetectionResult {
                         payload,
                         confidence: corr,
-                        offset: start,
+                        offset: start + frame_offset as usize,
                     });
-                    break;
                 }
             }
         }
@@ -87,7 +100,7 @@ pub fn detect(
                     results.push(DetectionResult {
                         payload,
                         confidence: corr,
-                        offset: 0,
+                        offset: frame_offset as usize,
                     });
                 }
             }

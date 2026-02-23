@@ -32,6 +32,17 @@ pub fn embed(
     embed::embed(samples, payload, key, config)
 }
 
+/// Embed a watermark into audio samples (in-place) starting at a frame offset.
+pub fn embed_with_offset(
+    samples: &mut [f32],
+    payload: &Payload,
+    key: &WatermarkKey,
+    config: &WatermarkConfig,
+    frame_offset: u32,
+) -> error::Result<()> {
+    embed::embed_with_offset(samples, payload, key, config, frame_offset)
+}
+
 /// Detect watermarks in audio samples.
 ///
 /// Returns all successfully detected watermark payloads.
@@ -42,4 +53,14 @@ pub fn detect(
     config: &WatermarkConfig,
 ) -> error::Result<Vec<DetectionResult>> {
     detect::detect(samples, key, config)
+}
+
+/// Detect watermarks in audio samples starting at a frame offset.
+pub fn detect_with_offset(
+    samples: &[f32],
+    key: &WatermarkKey,
+    config: &WatermarkConfig,
+    frame_offset: u32,
+) -> error::Result<Vec<DetectionResult>> {
+    detect::detect_with_offset(samples, key, config, frame_offset)
 }
