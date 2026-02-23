@@ -185,7 +185,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 num_bin_pairs,
                 min_bin,
                 max_bin,
-                ..Default::default()
             };
             let num_bins = config.num_bins();
             if config.min_bin >= num_bins || config.max_bin >= num_bins {
@@ -314,7 +313,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 num_bin_pairs,
                 min_bin,
                 max_bin,
-                ..Default::default()
             };
             let num_bins = config.num_bins();
             if config.min_bin >= num_bins || config.max_bin >= num_bins {

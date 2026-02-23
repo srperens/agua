@@ -34,14 +34,25 @@
 - [x] Optional rayon parallelism (`parallel` feature: `embed_parallel`, `detect_parallel`)
 - [x] Parallel benchmarks (embed + detect)
 
+### Phase 6: GStreamer Plugin — COMPLETE
+- [x] `agua-gst` crate added to workspace
+- [x] `aguawatermarkembed` GStreamer element (BaseTransform, in-place processing)
+- [x] Properties: key, payload, strength, frame-size, num-bin-pairs, min-bin, max-bin, offset-frames, profile
+- [x] Multi-channel support (per-channel embedding with independent frame tracking)
+- [x] No tests yet for agua-gst
+
 ### Outstanding Issues
-- [ ] No git commits yet — entire project is untracked
+- [ ] 2 clippy warnings in `agua-cli` (needless_update in main.rs:188, main.rs:317)
+- [ ] 3 clippy warnings in `agua-gst` (needless_range_loop embed.rs:347, collapsible_if embed.rs:358, needless_range_loop embed.rs:415)
+- [ ] No tests for `agua-gst`
+- [ ] Lossy codec robustness tests not yet validated (require ffmpeg)
 
 ### Test Summary
-- **47/47 tests passing** (40 unit + 3 parallel + 4 WAV integration)
+- **44/44 tests passing** (40 unit + 4 WAV integration), default features
+- **47/47 tests passing** with `--features parallel` (adds 3 parallel unit tests)
 - 9 additional `#[ignore]` tests (lossy codec round-trips + parameter tuning, require ffmpeg)
-- All modules have unit tests
-- CLI verified working end-to-end (embed + detect with broadband audio)
+- `cargo fmt --all --check` — clean
+- `cargo clippy` — 0 warnings in `agua-core`, 2 in `agua-cli`, 3 in `agua-gst`
 
 ### Benchmark Results (release build)
 | Benchmark | Time | Real-time ratio |
@@ -54,9 +65,28 @@
 
 Conclusion: **easily real-time capable** — thousands of times faster than real-time for both embedding and detection.
 
-### Files Implemented (14 .rs source + 4 test/bench)
+### Git History
+| Commit | Description |
+|--------|-------------|
+| `f9366e8` | feat: implement Agua audio watermarking library |
+| `5e6f2dc` | test: add WAV integration tests and criterion benchmarks |
+| `a8b011b` | some additions |
+| `8e4f0ae` | fix: correct GStreamer plugin lib name for symbol resolution |
+| `89db9a4` | feat: add robustness tests, rayon parallelism, and license files (Phase 5) |
+| `d1e0948` | feat: add GStreamer plugin for agua audio watermarking |
+| `dc9cf6b` | chore: add agua-gst to workspace and fmt agua-cli |
+
+### Workspace Crates
+| Crate | Type | Description |
+|-------|------|-------------|
+| `agua-core` | lib | Core watermarking library (14 modules, 47 tests w/ parallel) |
+| `agua-cli` | bin | CLI for embed/detect on WAV files |
+| `agua-gst` | lib (cdylib) | GStreamer plugin element `aguawatermarkembed` |
+
+### Files Implemented
 | Module | Tests | Status |
 |--------|-------|--------|
+| **agua-core** | | |
 | lib.rs | — | Public API re-exports |
 | error.rs | — | Error types |
 | key.rs | 6 | AES-PRNG bin selection |
@@ -75,3 +105,8 @@ Conclusion: **easily real-time capable** — thousands of times faster than real
 | tests/lossy_codec_round_trip.rs | 8 | MP3/AAC/Opus robustness (ignored) |
 | tests/parameter_tuning.rs | 1 | Strength x codec sweep (ignored) |
 | benches/throughput.rs | 5+2 | Criterion benchmarks (+ parallel) |
+| **agua-cli** | | |
+| main.rs | — | CLI binary (embed/detect commands) |
+| **agua-gst** | | |
+| lib.rs | — | Plugin registration |
+| embed.rs | — | `AguaWatermarkEmbed` BaseTransform element |

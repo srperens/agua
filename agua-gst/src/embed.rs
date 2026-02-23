@@ -344,8 +344,8 @@ mod imp {
 
             while state.adapter.len() >= frame_samples {
                 let mut interleaved = vec![0.0f32; frame_samples];
-                for i in 0..frame_samples {
-                    interleaved[i] = state.adapter.pop_front().unwrap();
+                for sample in interleaved.iter_mut().take(frame_samples) {
+                    *sample = state.adapter.pop_front().unwrap();
                 }
 
                 let global_frame = state.frame_index;
@@ -355,8 +355,8 @@ mod imp {
                         channel_buf[i] = interleaved[i * channels + ch];
                     }
 
-                    if global_frame >= settings.offset_frames {
-                        if let Err(err) = agua_core::embed_with_offset(
+                    if global_frame >= settings.offset_frames
+                        && let Err(err) = agua_core::embed_with_offset(
                             &mut channel_buf,
                             &payload,
                             &settings.key,
@@ -369,10 +369,10 @@ mod imp {
                                 max_bin: settings.max_bin,
                             },
                             global_frame as u32,
-                        ) {
-                            gst::error!(gst::CAT_DEFAULT, obj = self.obj(), "Embed failed: {err}");
-                            return Err(gst::FlowError::Error);
-                        }
+                        )
+                    {
+                        gst::error!(gst::CAT_DEFAULT, obj = self.obj(), "Embed failed: {err}");
+                        return Err(gst::FlowError::Error);
                     }
 
                     for i in 0..frame_size {
@@ -412,8 +412,8 @@ mod imp {
                         next.size_samples,
                     )
                 };
-                for i in 0..next.size_samples {
-                    out_samples[i] = state.processed.pop_front().unwrap();
+                for sample in out_samples.iter_mut().take(next.size_samples) {
+                    *sample = state.processed.pop_front().unwrap();
                 }
                 drop(map);
                 outbuf_mut.set_flags(next.flags);
