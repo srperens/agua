@@ -135,7 +135,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !frame_size.is_power_of_two() {
                 return Err(format!("frame_size must be power of 2, got {frame_size}").into());
             }
-            apply_profile(profile, &mut strength, &mut num_bin_pairs, &mut min_bin, &mut max_bin);
+            apply_profile(
+                profile,
+                &mut strength,
+                &mut num_bin_pairs,
+                &mut min_bin,
+                &mut max_bin,
+            );
             let reader = hound::WavReader::open(&input)?;
             let spec = reader.spec();
 
@@ -223,16 +229,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let needed_seconds = needed_samples as f32 / config.sample_rate as f32;
                 eprintln!(
                     "Warning: audio is too short for reliable detection ({} frames, need {}). Minimum duration ≈ {:.2}s at {}Hz.",
-                    num_frames,
-                    frames_per_block,
-                    needed_seconds,
-                    config.sample_rate
+                    num_frames, frames_per_block, needed_seconds, config.sample_rate
                 );
             }
 
             let start = effective_offset;
             let frame_offset = offset_frames as u32;
-            agua_core::embed_with_offset(&mut samples[start..], &wm_payload, &wm_key, &config, frame_offset)?;
+            agua_core::embed_with_offset(
+                &mut samples[start..],
+                &wm_payload,
+                &wm_key,
+                &config,
+                frame_offset,
+            )?;
 
             // Write output WAV
             let out_spec = hound::WavSpec {
@@ -264,7 +273,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err(format!("frame_size must be power of 2, got {frame_size}").into());
             }
             let mut strength = 0.01;
-            apply_profile(profile, &mut strength, &mut num_bin_pairs, &mut min_bin, &mut max_bin);
+            apply_profile(
+                profile,
+                &mut strength,
+                &mut num_bin_pairs,
+                &mut min_bin,
+                &mut max_bin,
+            );
             let reader = hound::WavReader::open(&input)?;
             let spec = reader.spec();
 
@@ -343,10 +358,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let needed_seconds = needed_samples as f32 / config.sample_rate as f32;
                 eprintln!(
                     "Warning: audio is too short for reliable detection ({} frames, need {}). Minimum duration ≈ {:.2}s at {}Hz.",
-                    num_frames,
-                    frames_per_block,
-                    needed_seconds,
-                    config.sample_rate
+                    num_frames, frames_per_block, needed_seconds, config.sample_rate
                 );
             }
 
