@@ -9,7 +9,7 @@ repository = "https://github.com/eyevinn/agua"
 
 [lib]
 name = "gstaguawatermark"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 agua-core = { path = "../agua-core" }
