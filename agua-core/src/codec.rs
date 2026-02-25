@@ -2,31 +2,32 @@ use crate::payload::TOTAL_DATA_BITS;
 
 /// Code rate: 1/6 (each input bit produces 6 output bits).
 pub const CODE_RATE_INV: usize = 6;
-/// Constraint length K=7, meaning 64 states.
-pub const CONSTRAINT_LENGTH: usize = 7;
+/// Constraint length K=15, meaning 16384 states.
+pub const CONSTRAINT_LENGTH: usize = 15;
 /// Number of states in the trellis (2^(K-1)).
 pub const NUM_STATES: usize = 1 << (CONSTRAINT_LENGTH - 1);
 /// Total coded bits output.
 pub const CODED_BITS: usize = TOTAL_DATA_BITS * CODE_RATE_INV;
 
-/// Generator polynomials for rate 1/6, K=7 convolutional code.
-/// These are standard polynomials in octal notation: 171, 133, 165, 117, 155, 127.
-const GENERATORS: [u8; CODE_RATE_INV] = [
-    0o171, // 0b1111001
-    0o133, // 0b1011011
-    0o165, // 0b1110101
-    0o117, // 0b1001111
-    0o155, // 0b1101101
-    0o127, // 0b1010111
+/// Generator polynomials for rate 1/6, K=15 convolutional code.
+/// These are standard good-distance polynomials in octal notation for K=15.
+/// Each is a 15-bit value.
+const GENERATORS: [u16; CODE_RATE_INV] = [
+    0o46233, // 0b100110010011011 = 19611
+    0o73251, // 0b111011010101001 = 30377
+    0o56637, // 0b101110110011111 = 23967
+    0o65763, // 0b110101111110011 = 28659
+    0o74545, // 0b111100101100101 = 31077
+    0o52353, // 0b101010011101011 = 21739
 ];
 
-/// Convolutional encoder (rate 1/6, K=7).
+/// Convolutional encoder (rate 1/6, K=15).
 pub fn encode(input_bits: &[bool]) -> Vec<bool> {
     let mut output = Vec::with_capacity(input_bits.len() * CODE_RATE_INV);
-    let mut state: u8 = 0; // 6-bit shift register
+    let mut state: u16 = 0; // 14-bit shift register
 
     for &bit in input_bits {
-        let input_val = if bit { 1u8 } else { 0u8 };
+        let input_val = if bit { 1u16 } else { 0u16 };
         // Current state + input bit forms K bits: [input, state[0], state[1], ..., state[K-2]]
         let reg = (input_val << (CONSTRAINT_LENGTH - 1)) | state;
 
@@ -37,13 +38,13 @@ pub fn encode(input_bits: &[bool]) -> Vec<bool> {
         }
 
         // Shift state: new state = [input, state[0], ..., state[K-3]]
-        state = ((input_val << (CONSTRAINT_LENGTH - 2)) | (state >> 1)) & (NUM_STATES as u8 - 1);
+        state = ((input_val << (CONSTRAINT_LENGTH - 2)) | (state >> 1)) & (NUM_STATES as u16 - 1);
     }
 
     output
 }
 
-/// Soft-decision Viterbi decoder (rate 1/6, K=7).
+/// Soft-decision Viterbi decoder (rate 1/6, K=15).
 ///
 /// `soft_bits` contains soft values where positive = more likely 1, negative = more likely 0.
 /// The magnitude indicates confidence.
@@ -60,13 +61,14 @@ pub fn decode(soft_bits: &[f32]) -> Vec<bool> {
     path_metric[0] = 0.0; // Start in state 0
 
     // Survivor paths: for each timestep and state, store the previous state
-    let mut survivors = vec![vec![0u8; NUM_STATES]; num_input_bits];
+    let mut survivors = vec![vec![0u16; NUM_STATES]; num_input_bits];
 
-    // Pre-compute expected output for each (state, input_bit) pair
-    let mut expected_output = vec![vec![[false; CODE_RATE_INV]; 2]; NUM_STATES];
+    // Pre-compute expected output for each (state, input_bit) pair.
+    // Using Vec<[[bool; CODE_RATE_INV]; 2]> for better memory layout and cache efficiency.
+    let mut expected_output = vec![[[false; CODE_RATE_INV]; 2]; NUM_STATES];
     for (state, state_outputs) in expected_output.iter_mut().enumerate() {
-        for input_bit in 0..2u8 {
-            let reg = (input_bit << (CONSTRAINT_LENGTH - 1)) | (state as u8);
+        for input_bit in 0..2u16 {
+            let reg = (input_bit << (CONSTRAINT_LENGTH - 1)) | (state as u16);
             for (g, &poly) in GENERATORS.iter().enumerate() {
                 let masked = reg & poly;
                 state_outputs[input_bit as usize][g] = masked.count_ones() % 2 == 1;
@@ -77,7 +79,7 @@ pub fn decode(soft_bits: &[f32]) -> Vec<bool> {
     // Trellis traversal
     for t in 0..num_input_bits {
         let mut new_metric = vec![f32::NEG_INFINITY; NUM_STATES];
-        let mut new_survivor = vec![0u8; NUM_STATES];
+        let mut new_survivor = vec![0u16; NUM_STATES];
 
         let soft_slice = &soft_bits[t * CODE_RATE_INV..(t + 1) * CODE_RATE_INV];
 
@@ -86,7 +88,7 @@ pub fn decode(soft_bits: &[f32]) -> Vec<bool> {
                 continue;
             }
 
-            for input_bit in 0..2u8 {
+            for input_bit in 0..2u16 {
                 // Compute branch metric (correlation with expected output)
                 let expected = &expected_output[state][input_bit as usize];
                 let mut branch_metric = 0.0f32;
@@ -104,7 +106,7 @@ pub fn decode(soft_bits: &[f32]) -> Vec<bool> {
                 let candidate = path_metric[state] + branch_metric;
                 if candidate > new_metric[next_state] {
                     new_metric[next_state] = candidate;
-                    new_survivor[next_state] = state as u8;
+                    new_survivor[next_state] = state as u16;
                 }
             }
         }
@@ -194,7 +196,7 @@ mod tests {
         }
 
         let decoded = decode(&soft);
-        // With rate 1/6, K=7, should handle ~5% bit error rate
+        // With rate 1/6, K=15, should handle ~5% bit error rate
         let errors: usize = decoded
             .iter()
             .zip(input.iter())

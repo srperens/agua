@@ -1,28 +1,49 @@
 use crate::key::WatermarkKey;
 
 /// Length of the sync pattern in bits.
-pub const SYNC_PATTERN_BITS: usize = 64;
+pub const SYNC_PATTERN_BITS: usize = 128;
 
 /// Generate a deterministic sync pattern from the watermark key.
-/// Returns a fixed 64-bit pattern used to mark the start of each watermark block.
+/// Returns a fixed 128-bit pattern used to mark the start of each watermark block.
+///
+/// Two AES blocks are encrypted with different counter values to produce
+/// 128 bits of pseudo-random sync pattern.
 pub fn generate_sync_pattern(key: &WatermarkKey) -> Vec<bool> {
-    // Use the key to generate a pseudo-random 64-bit sync pattern
-    // by encrypting a known block with a specific "sync" marker
     use aes::Aes128;
     use aes::cipher::{BlockEncrypt, KeyInit};
 
     let cipher = Aes128::new_from_slice(key.as_bytes()).expect("key is always 16 bytes");
-    let mut block = aes::Block::from([
+
+    // First block
+    let mut block1 = aes::Block::from([
         0x53, 0x59, 0x4E, 0x43, // "SYNC"
         0x50, 0x41, 0x54, 0x54, // "PATT"
         0x45, 0x52, 0x4E, 0x00, // "ERN\0"
         0x00, 0x00, 0x00, 0x00,
     ]);
-    cipher.encrypt_block(&mut block);
+    cipher.encrypt_block(&mut block1);
 
-    let bytes: [u8; 16] = block.into();
+    // Second block (different counter for different output)
+    let mut block2 = aes::Block::from([
+        0x53, 0x59, 0x4E, 0x43, // "SYNC"
+        0x50, 0x41, 0x54, 0x54, // "PATT"
+        0x45, 0x52, 0x4E, 0x00, // "ERN\0"
+        0x00, 0x00, 0x00, 0x01, // Different counter
+    ]);
+    cipher.encrypt_block(&mut block2);
+
+    let bytes1: [u8; 16] = block1.into();
+    let bytes2: [u8; 16] = block2.into();
+
     let mut pattern = Vec::with_capacity(SYNC_PATTERN_BITS);
-    for &byte in &bytes[..8] {
+    // First 64 bits from block 1
+    for &byte in &bytes1[..8] {
+        for j in (0..8).rev() {
+            pattern.push((byte >> j) & 1 == 1);
+        }
+    }
+    // Next 64 bits from block 2
+    for &byte in &bytes2[..8] {
         for j in (0..8).rev() {
             pattern.push((byte >> j) & 1 == 1);
         }

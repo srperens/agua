@@ -24,8 +24,8 @@ mod imp {
         strength: f32,
         frame_size: usize,
         num_bin_pairs: usize,
-        min_bin: usize,
-        max_bin: usize,
+        min_freq_hz: f32,
+        max_freq_hz: f32,
         offset_seconds: f32,
         sample_rate: u32,
         channels: u32,
@@ -41,11 +41,11 @@ mod imp {
                 payload: None,
                 key_passphrase,
                 key,
-                strength: 0.01,
+                strength: 0.02,
                 frame_size: 1024,
-                num_bin_pairs: 200,
-                min_bin: 5,
-                max_bin: 500,
+                num_bin_pairs: 30,
+                min_freq_hz: 860.0,
+                max_freq_hz: 4300.0,
                 offset_seconds: 0.0,
                 sample_rate: 48000,
                 channels: 1,
@@ -108,10 +108,10 @@ mod imp {
                         .build(),
                     glib::ParamSpecFloat::builder("strength")
                         .nick("Strength")
-                        .blurb("Embedding strength")
+                        .blurb("Embedding strength (power-law exponent delta)")
                         .minimum(0.0)
                         .maximum(10.0)
-                        .default_value(0.01)
+                        .default_value(0.02)
                         .build(),
                     glib::ParamSpecUInt::builder("frame-size")
                         .nick("Frame size")
@@ -125,21 +125,21 @@ mod imp {
                         .blurb("Number of bin pairs per frame")
                         .minimum(1)
                         .maximum(2000)
-                        .default_value(200)
+                        .default_value(30)
                         .build(),
-                    glib::ParamSpecUInt::builder("min-bin")
-                        .nick("Min bin")
-                        .blurb("Minimum FFT bin index")
-                        .minimum(1)
-                        .maximum(4096)
-                        .default_value(5)
+                    glib::ParamSpecFloat::builder("min-freq")
+                        .nick("Min frequency")
+                        .blurb("Minimum frequency in Hz for watermark embedding")
+                        .minimum(20.0)
+                        .maximum(20000.0)
+                        .default_value(860.0)
                         .build(),
-                    glib::ParamSpecUInt::builder("max-bin")
-                        .nick("Max bin")
-                        .blurb("Maximum FFT bin index")
-                        .minimum(2)
-                        .maximum(8192)
-                        .default_value(500)
+                    glib::ParamSpecFloat::builder("max-freq")
+                        .nick("Max frequency")
+                        .blurb("Maximum frequency in Hz for watermark embedding")
+                        .minimum(100.0)
+                        .maximum(20000.0)
+                        .default_value(4300.0)
                         .build(),
                     glib::ParamSpecFloat::builder("offset-seconds")
                         .nick("Offset seconds")
@@ -170,19 +170,19 @@ mod imp {
                     settings.key_passphrase = key_passphrase;
                 }
                 "strength" => {
-                    settings.strength = value.get::<f32>().unwrap_or(0.01);
+                    settings.strength = value.get::<f32>().unwrap_or(0.02);
                 }
                 "frame-size" => {
                     settings.frame_size = value.get::<u32>().unwrap_or(1024) as usize;
                 }
                 "num-bin-pairs" => {
-                    settings.num_bin_pairs = value.get::<u32>().unwrap_or(200) as usize;
+                    settings.num_bin_pairs = value.get::<u32>().unwrap_or(30) as usize;
                 }
-                "min-bin" => {
-                    settings.min_bin = value.get::<u32>().unwrap_or(5) as usize;
+                "min-freq" => {
+                    settings.min_freq_hz = value.get::<f32>().unwrap_or(860.0);
                 }
-                "max-bin" => {
-                    settings.max_bin = value.get::<u32>().unwrap_or(500) as usize;
+                "max-freq" => {
+                    settings.max_freq_hz = value.get::<f32>().unwrap_or(4300.0);
                 }
                 "offset-seconds" => {
                     settings.offset_seconds = value.get::<f32>().unwrap_or(0.0);
@@ -200,8 +200,8 @@ mod imp {
                 "strength" => settings.strength.to_value(),
                 "frame-size" => (settings.frame_size as u32).to_value(),
                 "num-bin-pairs" => (settings.num_bin_pairs as u32).to_value(),
-                "min-bin" => (settings.min_bin as u32).to_value(),
-                "max-bin" => (settings.max_bin as u32).to_value(),
+                "min-freq" => settings.min_freq_hz.to_value(),
+                "max-freq" => settings.max_freq_hz.to_value(),
                 "offset-seconds" => settings.offset_seconds.to_value(),
                 _ => unimplemented!(),
             }
@@ -365,8 +365,8 @@ mod imp {
                                 strength: settings.strength,
                                 frame_size: settings.frame_size,
                                 num_bin_pairs: settings.num_bin_pairs,
-                                min_bin: settings.min_bin,
-                                max_bin: settings.max_bin,
+                                min_freq_hz: settings.min_freq_hz,
+                                max_freq_hz: settings.max_freq_hz,
                             },
                             global_frame as u32,
                         )

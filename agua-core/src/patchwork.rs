@@ -3,11 +3,13 @@ use realfft::num_complex::Complex32;
 use crate::config::WatermarkConfig;
 use crate::key::WatermarkKey;
 
-/// Embed a single bit into a frequency-domain frame using the patchwork algorithm.
+/// Embed a single bit into a frequency-domain frame using power-law patchwork.
 ///
-/// For each bin pair (a, b), if bit is true, increase |a| and decrease |b|;
-/// if bit is false, decrease |a| and increase |b|. This creates a detectable
-/// statistical difference between the paired bins.
+/// For each bin pair (a, b), the magnitude is scaled via `mag^(1 +/- delta)`:
+/// - bit=true:  boost `a` (`mag_a^(1+delta)`), attenuate `b` (`mag_b^(1-delta)`)
+/// - bit=false: attenuate `a` (`mag_a^(1-delta)`), boost `b` (`mag_b^(1+delta)`)
+///
+/// Complex phase is preserved; only magnitudes change.
 pub fn embed_frame(
     freq_bins: &mut [Complex32],
     bit: bool,
@@ -15,12 +17,8 @@ pub fn embed_frame(
     frame_index: u32,
     config: &WatermarkConfig,
 ) {
-    let pairs = key.generate_bin_pairs(
-        frame_index,
-        config.num_bin_pairs,
-        config.min_bin,
-        config.max_bin,
-    );
+    let (min_bin, max_bin) = config.effective_bin_range();
+    let pairs = key.generate_bin_pairs(frame_index, config.num_bin_pairs, min_bin, max_bin);
     let delta = config.strength;
 
     for (a, b) in pairs {
@@ -35,37 +33,36 @@ pub fn embed_frame(
             continue;
         }
 
-        let (scale_a, scale_b) = if bit {
-            (1.0 + delta, 1.0 - delta)
+        // Power-law: use |ln(mag)| so the multiplier always pushes magnitude
+        // in the correct direction regardless of whether mag > 1 or mag < 1.
+        // For boost (exp > 0): multiplier = exp(delta * |ln(mag)|) > 1 always.
+        // For attenuate (exp < 0): multiplier = exp(-delta * |ln(mag)|) < 1 always.
+        let (exp_a, exp_b) = if bit {
+            (delta, -delta)
         } else {
-            (1.0 - delta, 1.0 + delta)
+            (-delta, delta)
         };
 
-        freq_bins[a] *= scale_a;
-        freq_bins[b] *= scale_b;
+        freq_bins[a] *= (exp_a * mag_a.ln().abs()).exp();
+        freq_bins[b] *= (exp_b * mag_b.ln().abs()).exp();
     }
 }
 
-/// Detect a single bit from a frequency-domain frame using the patchwork algorithm.
+/// Detect a single bit from a frequency-domain frame using log-ratio patchwork.
 ///
-/// Computes the patchwork statistic: sum of (|a| - |b|) / (|a| + |b|) for all bin pairs.
+/// Computes the average `ln(mag_a / mag_b)` across all bin pairs.
 /// Returns a soft value: positive suggests bit=1, negative suggests bit=0.
-/// The magnitude indicates confidence.
 pub fn detect_frame(
     freq_bins: &[Complex32],
     key: &WatermarkKey,
     frame_index: u32,
     config: &WatermarkConfig,
 ) -> f32 {
-    let pairs = key.generate_bin_pairs(
-        frame_index,
-        config.num_bin_pairs,
-        config.min_bin,
-        config.max_bin,
-    );
+    let (min_bin, max_bin) = config.effective_bin_range();
+    let pairs = key.generate_bin_pairs(frame_index, config.num_bin_pairs, min_bin, max_bin);
 
-    let mut sum_diff = 0.0f32;
-    let mut sum_total = 0.0f32;
+    let mut sum = 0.0f32;
+    let mut count = 0usize;
 
     for (a, b) in pairs {
         if a >= freq_bins.len() || b >= freq_bins.len() {
@@ -74,16 +71,19 @@ pub fn detect_frame(
         let mag_a = freq_bins[a].norm();
         let mag_b = freq_bins[b].norm();
 
-        sum_diff += mag_a - mag_b;
-        sum_total += mag_a + mag_b;
+        if mag_a < 1e-10 || mag_b < 1e-10 {
+            continue;
+        }
+
+        sum += (mag_a / mag_b).ln();
+        count += 1;
     }
 
-    if sum_total < 1e-10 {
+    if count == 0 {
         return 0.0;
     }
 
-    // Global normalization: the embedding shifts this ratio by approximately ±strength
-    sum_diff / sum_total
+    sum / count as f32
 }
 
 #[cfg(test)]
@@ -91,16 +91,15 @@ mod tests {
     use super::*;
     use crate::fft::FftProcessor;
 
-    /// Create a broadband test signal (many harmonics) for more reliable detection.
+    /// Create a broadband test signal with energy in the target frequency range.
+    /// Harmonics at FFT bins 10..100 cover the default 860-4300 Hz band.
     fn make_test_signal(size: usize) -> Vec<f32> {
         let mut signal = vec![0.0f32; size];
         for (i, sample) in signal.iter_mut().enumerate() {
             let t = i as f32 / size as f32;
-            // Use many harmonics for a broad spectrum
-            for k in 1..50 {
-                let freq = k as f32 * 100.0;
-                let amp = 1.0 / k as f32;
-                *sample += amp * (2.0 * std::f32::consts::PI * freq * t).sin();
+            for k in 10..100 {
+                let amp = 1.0 / (k as f32).sqrt();
+                *sample += amp * (2.0 * std::f32::consts::PI * k as f32 * t).sin();
             }
         }
         signal
@@ -109,7 +108,7 @@ mod tests {
     #[test]
     fn embed_detect_single_frame_bit_true() {
         let config = WatermarkConfig {
-            strength: 0.05, // Stronger for single-frame test
+            strength: 0.05,
             ..WatermarkConfig::default()
         };
         let key = WatermarkKey::new(&[42u8; 16]).unwrap();
@@ -187,7 +186,7 @@ mod tests {
         let shift_true = stat_true - baseline;
         let shift_false = stat_false - baseline;
 
-        // Shifts should be in opposite directions and roughly equal magnitude
+        // Shifts should be in opposite directions
         assert!(
             shift_true > 0.0,
             "bit=true should shift stat positive: {shift_true}"
@@ -212,14 +211,15 @@ mod tests {
         fft.inverse(&mut signal).unwrap();
         fft.normalize(&mut signal);
 
-        // Signal should be close to original (small perturbation)
+        // Signal should be close to original (small perturbation).
+        // Power-law encoding perturbs more than linear for large FFT magnitudes.
         let max_diff: f32 = original
             .iter()
             .zip(signal.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(
-            max_diff < 0.1,
+            max_diff < 0.5,
             "watermark perturbation too large: {max_diff}"
         );
     }

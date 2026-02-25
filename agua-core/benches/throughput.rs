@@ -39,7 +39,7 @@ fn bench_embed(c: &mut Criterion) {
 
 fn bench_detect(c: &mut Criterion) {
     let config = WatermarkConfig {
-        strength: 0.03,
+        strength: 0.05,
         ..WatermarkConfig::default()
     };
     let key = WatermarkKey::new(&[42u8; 16]).unwrap();
@@ -80,7 +80,7 @@ fn bench_stream_embed(c: &mut Criterion) {
 
 fn bench_stream_detect(c: &mut Criterion) {
     let config = WatermarkConfig {
-        strength: 0.03,
+        strength: 0.05,
         ..WatermarkConfig::default()
     };
     let key = WatermarkKey::new(&[42u8; 16]).unwrap();
@@ -124,7 +124,7 @@ fn bench_parallel_embed(c: &mut Criterion) {
 #[cfg(feature = "parallel")]
 fn bench_parallel_detect(c: &mut Criterion) {
     let config = WatermarkConfig {
-        strength: 0.03,
+        strength: 0.05,
         ..WatermarkConfig::default()
     };
     let key = WatermarkKey::new(&[42u8; 16]).unwrap();

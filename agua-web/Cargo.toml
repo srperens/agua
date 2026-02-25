@@ -1,0 +1,13 @@
+[package]
+name = "agua-web"
+version = "0.2.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Browser-based agua watermark detection via WASM"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+agua-core = { path = "../agua-core" }
+wasm-bindgen = "0.2"

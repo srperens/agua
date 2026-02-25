@@ -2,7 +2,8 @@
 //!
 //! Enable with the `parallel` feature flag. Provides `embed_parallel` and
 //! `detect_parallel` which use rayon to process FFT frames across multiple
-//! threads.
+//! threads. Both use Hann-windowed overlap-add (50% overlap) matching the
+//! sequential implementation.
 
 use rayon::prelude::*;
 
@@ -11,6 +12,7 @@ use crate::config::WatermarkConfig;
 use crate::embed::DetectionResult;
 use crate::error::{Error, Result};
 use crate::fft::FftProcessor;
+use crate::frame::hann_window;
 use crate::key::WatermarkKey;
 use crate::patchwork;
 use crate::payload::Payload;
@@ -19,10 +21,17 @@ use crate::sync::{self, SYNC_PATTERN_BITS, correlate_sync, generate_sync_pattern
 /// Number of frames processed per rayon task.
 const BATCH_SIZE: usize = 64;
 
+/// Minimum sync correlation threshold (matches detect.rs).
+const SYNC_THRESHOLD: f32 = 0.01;
+
+/// Maximum Viterbi decode attempts to limit cost (matches detect.rs).
+const MAX_DECODE_ATTEMPTS: usize = 5;
+
 /// Embed a watermark into audio samples using parallel processing.
 ///
-/// Functionally identical to [`crate::embed`] but uses rayon to process
-/// batches of frames in parallel. Each batch creates its own [`FftProcessor`].
+/// Functionally identical to [`crate::embed::embed`] but uses rayon to
+/// parallelize the FFT processing. The overlap-add is performed sequentially
+/// since overlapping frames write to shared output positions.
 pub fn embed_parallel(
     samples: &mut [f32],
     payload: &Payload,
@@ -47,7 +56,9 @@ pub fn embed_parallel_with_offset(
             got: samples.len(),
         });
     }
-    let num_frames = samples.len() / frame_size;
+
+    let hop_size = config.hop_size();
+    let num_frames = (samples.len() - frame_size) / hop_size + 1;
 
     // Prepare the bit sequence: sync pattern + convolutionally-encoded payload+CRC
     let sync_pattern = generate_sync_pattern(key);
@@ -61,42 +72,62 @@ pub fn embed_parallel_with_offset(
         .collect();
     let block_len = block_bits.len();
 
-    // Trim samples to exact frame boundary for par_chunks_mut
-    let usable = num_frames * frame_size;
-    let sample_slice = &mut samples[..usable];
+    let window = hann_window(frame_size);
 
-    // Process in batches of BATCH_SIZE frames.
-    // Each chunk of (BATCH_SIZE * frame_size) samples is one rayon task.
-    let chunk_size = BATCH_SIZE * frame_size;
+    // Phase 1: Parallel FFT processing. Each frame is independently windowed,
+    // FFT'd, modified, IFFT'd, and normalized. Results stored per-frame.
+    let frame_indices: Vec<usize> = (0..num_frames).collect();
+    let frame_buffers: Vec<Vec<f32>> = frame_indices
+        .par_chunks(BATCH_SIZE)
+        .flat_map(|batch| {
+            let mut fft = FftProcessor::new(frame_size).expect("FFT init should not fail");
+            batch
+                .iter()
+                .map(|&frame_idx| {
+                    let global_frame = frame_offset as usize + frame_idx;
+                    let bit_idx = global_frame % block_len;
+                    let bit = block_bits[bit_idx];
 
-    sample_slice
-        .par_chunks_mut(chunk_size)
-        .enumerate()
-        .try_for_each(|(chunk_idx, chunk)| -> Result<()> {
-            let mut fft = FftProcessor::new(frame_size)?;
-            let base_frame = chunk_idx * BATCH_SIZE;
-            let frames_in_chunk = chunk.len() / frame_size;
+                    let offset = frame_idx * hop_size;
+                    let mut buf = vec![0.0f32; frame_size];
+                    let end = (offset + frame_size).min(samples.len());
+                    buf[..end - offset].copy_from_slice(&samples[offset..end]);
 
-            for local_frame in 0..frames_in_chunk {
-                let frame_idx = base_frame + local_frame;
-                let global_frame = frame_offset as usize + frame_idx;
-                let bit_idx = global_frame % block_len;
-                let bit = block_bits[bit_idx];
+                    // Hann analysis window
+                    for (i, s) in buf.iter_mut().enumerate() {
+                        *s *= window[i];
+                    }
 
-                let offset = local_frame * frame_size;
-                let mut buf = chunk[offset..offset + frame_size].to_vec();
+                    fft.forward(&mut buf).expect("FFT forward should not fail");
+                    patchwork::embed_frame(
+                        fft.freq_bins_mut(),
+                        bit,
+                        key,
+                        global_frame as u32,
+                        config,
+                    );
+                    fft.inverse(&mut buf).expect("FFT inverse should not fail");
+                    fft.normalize(&mut buf);
 
-                fft.forward(&mut buf)?;
-                patchwork::embed_frame(fft.freq_bins_mut(), bit, key, global_frame as u32, config);
-                fft.inverse(&mut buf)?;
-                fft.normalize(&mut buf);
+                    buf
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
 
-                chunk[offset..offset + frame_size].copy_from_slice(&buf);
+    // Phase 2: Sequential overlap-add into output buffer.
+    let mut output = vec![0.0f32; samples.len()];
+    for (frame_idx, buf) in frame_buffers.iter().enumerate() {
+        let offset = frame_idx * hop_size;
+        for (i, &sample) in buf.iter().enumerate() {
+            let pos = offset + i;
+            if pos < output.len() {
+                output[pos] += sample;
             }
+        }
+    }
 
-            Ok(())
-        })?;
-
+    samples.copy_from_slice(&output);
     Ok(())
 }
 
@@ -126,78 +157,81 @@ pub fn detect_parallel_with_offset(
             got: samples.len(),
         });
     }
-    let num_frames = samples.len() / frame_size;
+
+    let hop_size = config.hop_size();
+    let num_frames = (samples.len() - frame_size) / hop_size + 1;
 
     let sync_pattern = generate_sync_pattern(key);
     let frames_per_block = sync::frames_per_block();
     let coded_bits_count = codec::CODED_BITS;
+    let window = hann_window(frame_size);
 
-    // Parallel FFT + soft-value extraction in batches
-    let chunk_size = BATCH_SIZE * frame_size;
-    let usable = num_frames * frame_size;
-    let sample_slice = &samples[..usable];
-
-    let batch_results: Vec<Vec<(usize, f32)>> = sample_slice
-        .par_chunks(chunk_size)
-        .enumerate()
-        .map(|(chunk_idx, chunk)| {
+    // Parallel FFT + soft-value extraction in batches.
+    // Each frame reads from the input (no mutation), so parallelism is safe.
+    let frame_indices: Vec<usize> = (0..num_frames).collect();
+    let soft_values: Vec<f32> = frame_indices
+        .par_chunks(BATCH_SIZE)
+        .flat_map(|batch| {
             let mut fft = FftProcessor::new(frame_size).expect("FFT init should not fail");
-            let base_frame = chunk_idx * BATCH_SIZE;
-            let frames_in_chunk = chunk.len() / frame_size;
+            batch
+                .iter()
+                .map(|&frame_idx| {
+                    let global_frame = frame_offset as usize + frame_idx;
+                    let offset = frame_idx * hop_size;
 
-            let mut local_softs = Vec::with_capacity(frames_in_chunk);
-            for local_frame in 0..frames_in_chunk {
-                let frame_idx = base_frame + local_frame;
-                let global_frame = frame_offset as usize + frame_idx;
-                let offset = local_frame * frame_size;
-                let mut buf = chunk[offset..offset + frame_size].to_vec();
-                fft.forward(&mut buf).expect("FFT forward should not fail");
-                let soft =
-                    patchwork::detect_frame(fft.freq_bins(), key, global_frame as u32, config);
-                local_softs.push((frame_idx, soft));
-            }
-            local_softs
+                    let mut buf = vec![0.0f32; frame_size];
+                    let end = (offset + frame_size).min(samples.len());
+                    buf[..end - offset].copy_from_slice(&samples[offset..end]);
+
+                    // Hann analysis window
+                    for (i, s) in buf.iter_mut().enumerate() {
+                        *s *= window[i];
+                    }
+
+                    fft.forward(&mut buf).expect("FFT forward should not fail");
+                    patchwork::detect_frame(fft.freq_bins(), key, global_frame as u32, config)
+                })
+                .collect::<Vec<_>>()
         })
         .collect();
 
-    // Flatten into ordered soft_values
-    let mut soft_values = vec![0.0f32; num_frames];
-    for batch in &batch_results {
-        for &(idx, val) in batch {
-            soft_values[idx] = val;
-        }
-    }
-
-    // Sequential sync search + Viterbi decode (same as detect.rs)
+    // Sequential sync search + Viterbi decode (best-first, matches detect.rs)
     let mut results = Vec::new();
 
     if num_frames >= frames_per_block {
-        // Strategy 1: Scan for sync patterns
-        for start in 0..=(num_frames - frames_per_block) {
-            let sync_soft = &soft_values[start..start + SYNC_PATTERN_BITS];
-            let corr = correlate_sync(sync_soft, &sync_pattern);
+        let scan_end = num_frames - frames_per_block;
+        let mut candidates: Vec<(usize, f32)> = (0..=scan_end)
+            .map(|start| {
+                let sync_soft = &soft_values[start..start + SYNC_PATTERN_BITS];
+                let corr = correlate_sync(sync_soft, &sync_pattern);
+                (start, corr)
+            })
+            .filter(|&(_, corr)| corr > SYNC_THRESHOLD)
+            .collect();
 
-            if corr > 0.15 {
-                let data_start = start + SYNC_PATTERN_BITS;
-                let data_end = data_start + coded_bits_count;
-                if data_end > num_frames {
-                    continue;
-                }
+        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-                let data_soft = &soft_values[data_start..data_end];
-                let decoded_bits = codec::decode(data_soft);
+        for &(start, corr) in candidates.iter().take(MAX_DECODE_ATTEMPTS) {
+            let data_start = start + SYNC_PATTERN_BITS;
+            let data_end = data_start + coded_bits_count;
+            if data_end > num_frames {
+                continue;
+            }
 
-                if let Ok(payload) = Payload::decode_with_crc(&decoded_bits) {
-                    results.push(DetectionResult {
-                        payload,
-                        confidence: corr,
-                        offset: start + frame_offset as usize,
-                    });
-                }
+            let data_soft = &soft_values[data_start..data_end];
+            let decoded_bits = codec::decode(data_soft);
+
+            if let Ok(payload) = Payload::decode_with_crc(&decoded_bits) {
+                results.push(DetectionResult {
+                    payload,
+                    confidence: corr,
+                    offset: start + frame_offset as usize,
+                });
+                break;
             }
         }
 
-        // Strategy 2: Try offset 0 directly (no sync threshold)
+        // Fallback: try offset 0 directly (no sync threshold)
         if results.is_empty() {
             let data_start = SYNC_PATTERN_BITS;
             let data_end = data_start + coded_bits_count;
@@ -250,7 +284,7 @@ mod tests {
     #[test]
     fn parallel_embed_matches_sequential() {
         let config = WatermarkConfig {
-            strength: 0.03,
+            strength: 0.05,
             ..WatermarkConfig::default()
         };
         let key = WatermarkKey::new(&[42u8; 16]).unwrap();
@@ -276,7 +310,7 @@ mod tests {
     #[test]
     fn parallel_detect_matches_sequential() {
         let config = WatermarkConfig {
-            strength: 0.03,
+            strength: 0.05,
             ..WatermarkConfig::default()
         };
         let key = WatermarkKey::new(&[42u8; 16]).unwrap();
@@ -285,7 +319,7 @@ mod tests {
             0xBA, 0x98,
         ]);
 
-        let num_samples = 48000 * 22;
+        let num_samples = 48000 * 20;
         let mut audio = make_test_audio(num_samples, config.sample_rate);
         crate::embed::embed(&mut audio, &payload, &key, &config).unwrap();
 
@@ -303,7 +337,7 @@ mod tests {
     #[test]
     fn parallel_embed_detect_round_trip() {
         let config = WatermarkConfig {
-            strength: 0.03,
+            strength: 0.05,
             ..WatermarkConfig::default()
         };
         let key = WatermarkKey::new(&[42u8; 16]).unwrap();
@@ -312,7 +346,7 @@ mod tests {
             0x33, 0x44,
         ]);
 
-        let num_samples = 48000 * 22;
+        let num_samples = 48000 * 20;
         let mut audio = make_test_audio(num_samples, config.sample_rate);
 
         embed_parallel(&mut audio, &payload, &key, &config).unwrap();

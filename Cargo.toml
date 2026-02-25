@@ -1,3 +1,8 @@
 [workspace]
-members = ["agua-core", "agua-cli", "agua-gst"]
+members = ["agua-core", "agua-cli", "agua-gst", "agua-web"]
 resolver = "3"
+
+# Optimise WASM binary size for agua-web
+[profile.release]
+opt-level = "s"
+lto = true

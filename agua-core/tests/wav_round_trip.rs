@@ -75,7 +75,7 @@ fn read_wav_f32(path: &std::path::Path) -> (Vec<f32>, u32) {
 #[test]
 fn wav_f32_embed_detect_round_trip() {
     let config = WatermarkConfig {
-        strength: 0.03,
+        strength: 0.05,
         ..WatermarkConfig::default()
     };
     let key = WatermarkKey::new(&[42u8; 16]).unwrap();
@@ -107,7 +107,7 @@ fn wav_f32_embed_detect_round_trip() {
 #[test]
 fn wav_i16_embed_detect_round_trip() {
     let config = WatermarkConfig {
-        strength: 0.03,
+        strength: 0.05,
         ..WatermarkConfig::default()
     };
     let key = WatermarkKey::new(&[42u8; 16]).unwrap();
@@ -141,7 +141,7 @@ fn wav_i16_embed_detect_round_trip() {
 fn wav_44100_sample_rate() {
     let config = WatermarkConfig {
         sample_rate: 44100,
-        strength: 0.03,
+        strength: 0.05,
         ..WatermarkConfig::default()
     };
     let key = WatermarkKey::from_passphrase("test-key-44100");
@@ -170,7 +170,7 @@ fn wav_streaming_embed_file_detect() {
     use agua_core::StreamEmbedder;
 
     let config = WatermarkConfig {
-        strength: 0.03,
+        strength: 0.05,
         ..WatermarkConfig::default()
     };
     let key = WatermarkKey::new(&[7u8; 16]).unwrap();

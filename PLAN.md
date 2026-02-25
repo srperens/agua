@@ -1,150 +1,143 @@
-# Agua: Audio Watermarking Library in Rust
+# Agua v0.2: Acoustic-Robust Watermarking
 
 ## Context
 
-New Rust library for audio watermarking at Eyevinn. Needs a base crate for embedding/detecting watermarks, with GStreamer plugin support later. Must be fast (real-time capable), robust (survive MP3/AAC), and patent-safe for open source use.
+agua-core v0.1 is integrated in strom via agua-gst, but its current algorithm is too weak to survive lossy codecs (MP3/AAC) and especially the acoustic channel (speaker -> air -> microphone). The goal is to upgrade the algorithm with techniques proven by audiowmark: narrow frequency band, power-law encoding, Hann windowed overlap-add, and stronger FEC. This enables a future use case: WASM-compiled detection running in a mobile browser using the phone's microphone.
 
-## Research Summary
+audiowmark compatibility is NOT required now but the architecture should allow adding it as an option later. There is no need to preserve backward compatibility with agua v0.1 - it is not used in production.
 
-### Algorithm: Patchwork in FFT Domain
-audiowmark uses the **patchwork algorithm** (Bender et al., 1996) in the frequency domain — NOT classical spread-spectrum. It splits audio into 1024-sample frames, applies FFT, uses an AES-128 key to pseudo-randomly select frequency bin pairs, and modifies their magnitudes to encode bits. Convolutional coding + interleaved sync frames provide error correction and blind detection. 128-bit payload capacity.
+## Key Design Decisions
 
-### Patent Status: LOW RISK
-- Patchwork algorithm published academically (1996, IBM Systems Journal) — **not patented**
-- Cox/NEC spread-spectrum patents: **expired** (2015-2017)
-- Microsoft audio watermarking patents: **expired** (2021)
-- Digimarc time-frequency domain patent: **expired** (2020)
-- audiowmark has been open source since 2018 without patent challenges
-- Caveat: Digimarc/Verance have large portfolios with some newer patents — avoid their specific techniques
+1. **No legacy/profile system.** agua v0.1 is not deployed anywhere. We replace the algorithm wholesale - simpler code, no branching.
 
-### Port vs. Clean-Room Implementation: CLEAN-ROOM
-- audiowmark is **GPLv3** — cannot port code if we want MIT/Apache-2.0 license
-- We implement the same general approach based on **published academic papers** (Bender 1996, Steinebach 2004)
-- The algorithm is well-documented; no need to reverse-engineer anything
+2. **Sample rate stays configurable** (default 48000). Bin range computed dynamically from target frequencies (860-4300 Hz). At 48kHz/1024 FFT: bins 19-92.
 
-## Architecture
+3. **FEC: K=15, rate 1/6.** 16384 Viterbi states, ~5 MB memory. Acceptable for WASM on mobile. Architecture supports changing K later (e.g. K=16 for audiowmark compat).
 
-### Workspace Structure
+4. **Hann window + overlap-add always on.** 50% hop. Frame advance = 512 samples, block duration ~11.6s at 48kHz (shorter than current 21.8s).
+
+5. **Public API stays the same**: `embed()`, `detect()`, `StreamEmbedder`, `StreamDetector`, `WatermarkConfig`. Internals change, signatures don't.
+
+## New Parameters (replaces v0.1 defaults)
+
+| Parameter | Value |
+|---|---|
+| Frequency range | ~860-4300 Hz (computed from sample_rate) |
+| Bin pairs/frame | 30 |
+| Encoding | Power-law: `mag^(1+/-delta)` |
+| FFT window | Hann + overlap-add (50% hop) |
+| Frame advance | 512 samples |
+| FEC constraint length K | 15 (16384 states) |
+| FEC rate | 1/6 |
+| Sync bits | 128 |
+| Coded data bits | 960 (160 data * 6) |
+| Frames/block | 1088 (128 sync + 960 data) |
+| Block duration (48kHz) | ~11.6s |
+| Default strength | 0.02 |
+| Payload | 128 bits + CRC-32 (kept) |
+
+## Phases
+
+### Phase 1: Config + Power-Law Encoding
+
+**Files:** `agua-core/src/config.rs`, `agua-core/src/patchwork.rs`
+
+Config changes:
+- Change defaults: `num_bin_pairs=30`, `strength=0.02`
+- Replace `min_bin`/`max_bin` with `min_freq_hz: f32` (860.0) and `max_freq_hz: f32` (4300.0)
+- Add `effective_bin_range(&self) -> (usize, usize)` computing bins from freq + sample_rate + frame_size
+- Keep `frame_size=1024`, `sample_rate=48000`
+
+Patchwork changes (replace, not branch):
+- `embed_frame()`: power-law encoding `mag.powf(1.0 +/- delta)`, scale complex bin by magnitude ratio
+- `detect_frame()`: log-ratio detection `(mag_a / mag_b).ln()` as soft value
+
+**Test:** Embed+detect round-trip with new encoding. Verify soft values have correct sign.
+
+### Phase 2: Hann Window + Overlap-Add
+
+**Files:** `agua-core/src/frame.rs`, `agua-core/src/embed.rs`, `agua-core/src/detect.rs`, `agua-core/src/stream.rs`
+
+- `frame.rs`: Pre-computed normalized Hann window. Overlap-add buffer utilities.
+- `embed.rs`: Process with `hop_size=512` advance. Analysis window (Hann) before FFT, synthesis window (Hann) after IFFT, overlap-add output.
+- `detect.rs`: Analysis frames with `hop_size` advance + Hann window before FFT.
+- `stream.rs`: Update `StreamEmbedder`/`StreamDetector` buffering - retain `frame_size - hop_size` samples overlap between chunks.
+
+**Test:** COLA unity gain (embed strength=0, output == input). Full embed+detect round-trip.
+
+### Phase 3: Stronger FEC (K=15 Viterbi)
+
+**Files:** `agua-core/src/codec.rs`, `agua-core/src/sync.rs`
+
+Codec changes:
+- Change constants: `CONSTRAINT_LENGTH=15`, generators to 6 good K=15 rate-1/6 polynomials (u16 wide)
+- `NUM_STATES = 16384`
+- Widen shift register and generator masks from u8 to u16
+- Encoder and Viterbi decoder structurally unchanged, just wider state space
+- WASM: use `u16` for state indices in survivor matrix to save memory
+
+Sync changes:
+- Increase sync pattern from 64 to 128 bits
+- `generate_sync_pattern()`: encrypt two AES blocks to get 128 bits
+
+**Test:** Encode/decode round-trip. Noise tolerance test (inject bit errors, verify K=15 corrects more than old K=7 could).
+
+### Phase 4: Integration + Full Wiring
+
+**Files:** `agua-core/src/embed.rs`, `agua-core/src/detect.rs`, `agua-core/src/stream.rs`, `agua-core/src/key.rs`, `agua-core/src/parallel.rs`
+
+- Wire `config.effective_bin_range()` into bin pair generation in `key.rs`
+- Update block size calculations throughout (1088 frames/block)
+- Update `parallel.rs` - parallelization at block level (frames overlap, can't parallelize within block trivially)
+- End-to-end integration of all Phase 1-3 changes
+
+**Test:** Full round-trip embed+detect. Streaming embed+detect matches batch. Parallel matches sequential.
+
+### Phase 5: GStreamer Element + CLI
+
+**Files:** `agua-gst/src/embed.rs`, `agua-cli/src/main.rs`
+
+- GStreamer: update property defaults (`strength=0.02`), replace `min-bin`/`max-bin` props with `min-freq`/`max-freq`, update `num-bin-pairs` default to 30
+- CLI: update defaults
+
+**No strom changes needed** beyond bumping the agua-gst dependency tag.
+
+### Phase 6: Robustness Validation
+
+**Files:** `agua-core/tests/`
+
+- Update `lossy_codec_round_trip.rs` for new parameters
+- New `acoustic_simulation.rs`: low-pass filter (8kHz) + white noise (20dB SNR) + resample jitter -> detect succeeds
+- Update `benches/throughput.rs` with new algorithm benchmarks
+- WASM compile test: `cargo build --target wasm32-unknown-unknown -p agua-core`
+
+## Phase Dependencies
+
 ```
-agua/
-  Cargo.toml              # workspace: [agua-core, agua-cli]
-  LICENSE-MIT
-  LICENSE-APACHE
-  agua-core/               # library crate
-    Cargo.toml
-    src/
-      lib.rs               # Public API re-exports
-      error.rs             # Error types (thiserror)
-      key.rs               # WatermarkKey, AES-PRNG for bin selection
-      fft.rs               # realfft wrapper, pre-allocated buffers
-      frame.rs             # Windowing, overlap-add reconstruction
-      patchwork.rs         # Core: per-frame embed/detect in frequency domain
-      sync.rs              # Sync frame generation + correlation detection
-      codec.rs             # Convolutional encoder + soft-decision Viterbi decoder
-      payload.rs           # 128-bit payload, CRC-32
-      config.rs            # WatermarkConfig (strength, sample_rate)
-      embed.rs             # High-level embedding pipeline
-      detect.rs            # High-level detection pipeline
-  agua-cli/                # binary crate
-    Cargo.toml
-    src/main.rs
+Phase 1 (Config + Power-law) ──┐
+Phase 2 (Overlap-add) ─────────┼──> Phase 4 (Integration) ──> Phase 5 (GST+CLI)
+Phase 3 (FEC K=15) ────────────┘                          ──> Phase 6 (Validation)
 ```
 
-### Public API (agua-core)
-```rust
-// One-shot (for files)
-pub fn embed(samples: &mut [f32], payload: &Payload, key: &WatermarkKey, config: &WatermarkConfig) -> Result<(), Error>;
-pub fn detect(samples: &[f32], key: &WatermarkKey, config: &WatermarkConfig) -> Result<Vec<DetectionResult>, Error>;
+Phases 1, 2, 3 can be developed largely in parallel (they touch different files), with Phase 4 integrating them.
 
-// Streaming (for GStreamer / real-time)
-pub struct StreamEmbedder { ... }  // process(&mut self, input: &[f32]) -> Vec<f32>
-pub struct StreamDetector { ... }  // process(&mut self, input: &[f32]) -> Vec<DetectionResult>
-```
+## Risks
 
-All APIs operate on mono f32 sample buffers. No file I/O in the core library.
-
-### Algorithm Pipeline
-
-**Embedding:**
-```
-Payload (128 bits) -> CRC-32 append (160 bits) -> Conv. encode rate 1/6 (960 bits)
--> Interleave with sync frames -> Per-frame patchwork embed (FFT -> modify bins -> IFFT)
--> Overlap-add -> Watermarked audio
-```
-
-**Detection:**
-```
-Audio -> Frame FFT -> Sync correlation search -> Soft-bit extraction per frame
--> Viterbi decode (960 soft values -> 160 bits) -> CRC check -> Payload + confidence
-```
-
-### Dependencies
-| Crate | Purpose | Why |
-|-------|---------|-----|
-| `realfft` 3.5 | FFT/IFFT | 2x faster for real signals, AVX auto-detection |
-| `aes` 0.8 + `cipher` 0.4 | AES-128 PRNG | AES-NI accelerated, deterministic bin selection |
-| `thiserror` 2 | Error types | Standard |
-| `hound` 3.5 (dev) | WAV I/O for tests | |
-| `clap` 4 (cli only) | CLI args | |
-| `criterion` 0.5 (dev) | Benchmarks | |
-
-**No external FEC crate** — Viterbi decoder implemented from scratch (~300-500 lines) because existing Rust crates lack soft-decision support.
-
-### Performance
-- FFT: rustfft has AVX auto-detection, realfft halves the work for real signals
-- AES: AES-NI accelerated via RustCrypto
-- Zero allocations per frame in steady state (pre-allocated buffers)
-- Streaming latency: 1 frame = 1024 samples = ~21ms at 48kHz
-- Optional `rayon` feature flag for parallel detection
-
-## Implementation Order
-
-### Phase 1: Foundations
-1. Set up workspace structure (Cargo.toml files, directories)
-2. `error.rs` — Error enum
-3. `key.rs` — WatermarkKey + AES-PRNG with tests
-4. `fft.rs` — FFT wrapper with round-trip tests
-
-### Phase 2: Core Algorithm
-5. `config.rs` + `payload.rs` — Config and payload types
-6. `patchwork.rs` — Single-frame embed/detect with tests
-7. `codec.rs` — Convolutional encoder + Viterbi decoder with tests
-
-### Phase 3: Integration
-8. `sync.rs` — Sync generation + correlation detection
-9. `frame.rs` — Windowing + overlap-add
-10. `embed.rs` — Full embedding pipeline
-11. `detect.rs` — Full detection pipeline + round-trip integration tests
-
-### Phase 4: Streaming + CLI
-12. `StreamEmbedder` / `StreamDetector` — Streaming wrappers
-13. `agua-cli` — CLI binary (embed/detect commands)
-14. Integration tests with WAV files, benchmarks
-
-### Phase 5: Robustness (later)
-15. MP3/AAC round-trip robustness tests
-16. Parameter tuning
-17. Optional rayon parallelism
+| Risk | Impact | Mitigation |
+|---|---|---|
+| K=15 polynomial selection | Bad polynomials = weak FEC | Use published tables (Proakis, Lin & Costello). Fallback: K=13 (4096 states) |
+| Overlap-add streaming complexity | Bugs in StreamEmbedder buffering | Compare streaming vs batch output in tests |
+| WASM Viterbi memory (~5 MB) | Might be tight on low-end phones | K=13 fallback (1.3 MB) if needed; test on real devices |
 
 ## Verification
-- Unit tests per module (determinism, round-trip, correctness)
-- Integration test: generate sine wave -> embed -> detect -> verify payload
-- WAV round-trip test with `hound`
-- Benchmark: embed/detect throughput with criterion
-- Later: MP3 robustness tests (require ffmpeg/lame)
 
-## Key Parameters
-| Parameter | Value |
-|-----------|-------|
-| Frame size | 1024 samples |
-| FFT bins | 513 (real FFT of 1024) |
-| Bin pairs per frame | ~30 |
-| Useful bin range | 5-500 |
-| Code rate | 1/6 |
-| Constraint length | 7 (64 states) |
-| Payload | 128 bits |
-| CRC | 32 bits |
-| Sync pattern | 64 bits |
+1. `cargo test` - all tests pass
+2. `cargo test --features parallel` - parallel mode tests pass
+3. Lossy codec round-trip: embed, encode MP3 128k, detect -> success
+4. Acoustic simulation: low-pass + noise -> detects successfully
+5. GStreamer: `gst-launch-1.0 audiotestsrc ! audioconvert ! aguaembed payload=... ! fakesink` runs
+6. WASM: `cargo build --target wasm32-unknown-unknown -p agua-core` compiles
 
 ## License
-Dual MIT/Apache-2.0 (Rust ecosystem convention, fully permissive).
+
+Dual MIT/Apache-2.0 (unchanged).

@@ -6,5 +6,6 @@
 *~
 .idea/
 .vscode/
+.claude/
 *.wav
 *.mp3

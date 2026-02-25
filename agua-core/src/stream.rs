@@ -2,6 +2,7 @@ use crate::codec;
 use crate::config::WatermarkConfig;
 use crate::embed::DetectionResult;
 use crate::fft::FftProcessor;
+use crate::frame::hann_window;
 use crate::key::WatermarkKey;
 use crate::patchwork;
 use crate::payload::Payload;
@@ -10,14 +11,23 @@ use crate::sync::{self, SYNC_PATTERN_BITS, correlate_sync, generate_sync_pattern
 /// Streaming watermark embedder.
 ///
 /// Accepts arbitrary-length input chunks and produces watermarked output.
-/// Internally buffers to maintain frame alignment.
+/// Internally buffers to maintain frame alignment with 50% overlap
+/// using Hann-windowed overlap-add. The Hann analysis window at 50%
+/// overlap satisfies the COLA condition (sum = 1.0) for perfect
+/// reconstruction.
 pub struct StreamEmbedder {
     config: WatermarkConfig,
     key: WatermarkKey,
     fft: FftProcessor,
     block_bits: Vec<bool>,
+    window: Vec<f32>,
     input_buf: Vec<f32>,
+    /// Overlap buffer holding the tail of the previous frame's output
+    /// (frame_size - hop_size samples that overlap with the next frame).
+    overlap_buf: Vec<f32>,
     frame_counter: usize,
+    /// Whether we have processed at least one frame (needed for output logic).
+    first_frame_done: bool,
 }
 
 impl StreamEmbedder {
@@ -38,26 +48,42 @@ impl StreamEmbedder {
             .collect();
 
         let fft = FftProcessor::new(config.frame_size)?;
+        let window = hann_window(config.frame_size);
+        let hop_size = config.hop_size();
 
         Ok(Self {
             config: config.clone(),
             key: key.clone(),
             fft,
             block_bits,
+            window,
             input_buf: Vec::new(),
+            overlap_buf: vec![0.0f32; config.frame_size - hop_size],
             frame_counter: 0,
+            first_frame_done: false,
         })
     }
 
     /// Process input samples and return watermarked output.
+    ///
+    /// Uses Hann-windowed overlap-add with 50% overlap. Each call may
+    /// produce fewer samples than the input if buffering is needed.
     pub fn process(&mut self, input: &[f32]) -> Vec<f32> {
         self.input_buf.extend_from_slice(input);
         let frame_size = self.config.frame_size;
+        let hop_size = self.config.hop_size();
         let mut result = Vec::new();
 
         while self.input_buf.len() >= frame_size {
-            let mut buf: Vec<f32> = self.input_buf.drain(..frame_size).collect();
+            // Extract frame_size samples from input buffer (advance by hop_size later)
+            let mut buf = self.input_buf[..frame_size].to_vec();
 
+            // Apply Hann analysis window
+            for (i, s) in buf.iter_mut().enumerate() {
+                *s *= self.window[i];
+            }
+
+            // FFT -> embed -> IFFT -> normalize
             self.fft
                 .forward(&mut buf)
                 .expect("buffer size matches frame_size");
@@ -77,26 +103,67 @@ impl StreamEmbedder {
                 .expect("buffer size matches frame_size");
             self.fft.normalize(&mut buf);
 
-            result.extend_from_slice(&buf);
+            // Overlap-add WITHOUT synthesis window (analysis-only COLA = 1.0).
+            let mut frame_output = vec![0.0f32; frame_size];
+
+            // Add overlap from previous frame
+            for (i, &ov) in self.overlap_buf.iter().enumerate() {
+                frame_output[i] = ov;
+            }
+
+            // Add current frame
+            for (i, &s) in buf.iter().enumerate() {
+                frame_output[i] += s;
+            }
+
+            // Output the first hop_size samples (they are complete)
+            if self.first_frame_done {
+                result.extend_from_slice(&frame_output[..hop_size]);
+            } else {
+                result.extend_from_slice(&frame_output[..hop_size]);
+                self.first_frame_done = true;
+            }
+
+            // Save the remaining samples as overlap for the next frame
+            self.overlap_buf
+                .copy_from_slice(&frame_output[hop_size..frame_size]);
+
+            // Advance input by hop_size (not frame_size)
+            self.input_buf.drain(..hop_size);
             self.frame_counter += 1;
         }
 
         result
     }
 
-    /// Flush remaining buffered samples (unmodified, since they don't form a full frame).
+    /// Flush remaining buffered samples.
+    ///
+    /// Returns the overlap buffer (which contains the tail of the last
+    /// processed frame) plus any unprocessed input samples.
     pub fn flush(&mut self) -> Vec<f32> {
-        self.input_buf.drain(..).collect()
+        let mut out = Vec::new();
+        // Output the remaining overlap
+        out.extend_from_slice(&self.overlap_buf);
+        // Output any remaining input that didn't form a full frame
+        out.append(&mut self.input_buf);
+        // Reset overlap
+        for s in self.overlap_buf.iter_mut() {
+            *s = 0.0;
+        }
+        out
     }
 }
 
 /// Streaming watermark detector.
 ///
 /// Accepts arbitrary-length input chunks and reports detected watermarks.
+/// Uses Hann-windowed overlapping frames (50% overlap) matching the
+/// embedding scheme.
 pub struct StreamDetector {
     config: WatermarkConfig,
     key: WatermarkKey,
     fft: FftProcessor,
+    window: Vec<f32>,
     sync_pattern: Vec<bool>,
     frames_per_block: usize,
     coded_bits_count: usize,
@@ -109,6 +176,7 @@ impl StreamDetector {
     /// Create a new streaming detector.
     pub fn new(key: &WatermarkKey, config: &WatermarkConfig) -> crate::error::Result<Self> {
         let fft = FftProcessor::new(config.frame_size)?;
+        let window = hann_window(config.frame_size);
         let sync_pattern = generate_sync_pattern(key);
         let frames_per_block = sync::frames_per_block();
         let coded_bits_count = codec::CODED_BITS;
@@ -117,6 +185,7 @@ impl StreamDetector {
             config: config.clone(),
             key: key.clone(),
             fft,
+            window,
             sync_pattern,
             frames_per_block,
             coded_bits_count,
@@ -130,10 +199,15 @@ impl StreamDetector {
     pub fn process(&mut self, input: &[f32]) -> Vec<DetectionResult> {
         self.input_buf.extend_from_slice(input);
         let frame_size = self.config.frame_size;
+        let hop_size = self.config.hop_size();
         let mut results = Vec::new();
 
         while self.input_buf.len() >= frame_size {
-            let mut buf: Vec<f32> = self.input_buf.drain(..frame_size).collect();
+            // Extract frame_size samples and apply Hann analysis window
+            let mut buf = self.input_buf[..frame_size].to_vec();
+            for (i, s) in buf.iter_mut().enumerate() {
+                *s *= self.window[i];
+            }
 
             self.fft
                 .forward(&mut buf)
@@ -154,6 +228,9 @@ impl StreamDetector {
                 results.push(result);
                 self.soft_values.clear();
             }
+
+            // Advance input by hop_size (not frame_size)
+            self.input_buf.drain(..hop_size);
         }
 
         results

@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -28,13 +28,9 @@ enum Command {
         #[arg(short, long, default_value = "agua-default-key")]
         key: String,
 
-        /// Embedding strength (0.001 - 0.1)
-        #[arg(short, long, default_value = "0.01")]
+        /// Embedding strength (power-law exponent delta)
+        #[arg(short, long, default_value = "0.02")]
         strength: f32,
-
-        /// Parameter profile
-        #[arg(long, value_enum)]
-        profile: Option<Profile>,
 
         /// Delay before embedding starts (seconds)
         #[arg(long, default_value = "0")]
@@ -45,16 +41,16 @@ enum Command {
         frame_size: usize,
 
         /// Number of bin pairs per frame
-        #[arg(long, default_value = "200")]
+        #[arg(long, default_value = "30")]
         num_bin_pairs: usize,
 
-        /// Minimum FFT bin index
-        #[arg(long, default_value = "5")]
-        min_bin: usize,
+        /// Minimum frequency in Hz for watermark embedding
+        #[arg(long, default_value = "860.0")]
+        min_freq: f32,
 
-        /// Maximum FFT bin index
-        #[arg(long, default_value = "500")]
-        max_bin: usize,
+        /// Maximum frequency in Hz for watermark embedding
+        #[arg(long, default_value = "4300.0")]
+        max_freq: f32,
     },
     /// Detect a watermark in a WAV file
     Detect {
@@ -66,10 +62,6 @@ enum Command {
         #[arg(short, long, default_value = "agua-default-key")]
         key: String,
 
-        /// Parameter profile
-        #[arg(long, value_enum)]
-        profile: Option<Profile>,
-
         /// Start offset for detection (seconds)
         #[arg(long, default_value = "0")]
         offset_seconds: f32,
@@ -79,40 +71,17 @@ enum Command {
         frame_size: usize,
 
         /// Number of bin pairs per frame
-        #[arg(long, default_value = "200")]
+        #[arg(long, default_value = "30")]
         num_bin_pairs: usize,
 
-        /// Minimum FFT bin index
-        #[arg(long, default_value = "5")]
-        min_bin: usize,
+        /// Minimum frequency in Hz for watermark embedding
+        #[arg(long, default_value = "860.0")]
+        min_freq: f32,
 
-        /// Maximum FFT bin index
-        #[arg(long, default_value = "500")]
-        max_bin: usize,
+        /// Maximum frequency in Hz for watermark embedding
+        #[arg(long, default_value = "4300.0")]
+        max_freq: f32,
     },
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum Profile {
-    Music,
-}
-
-fn apply_profile(
-    profile: Option<Profile>,
-    strength: &mut f32,
-    num_bin_pairs: &mut usize,
-    min_bin: &mut usize,
-    max_bin: &mut usize,
-) {
-    match profile {
-        Some(Profile::Music) => {
-            *strength = 0.05;
-            *num_bin_pairs = 50;
-            *min_bin = 5;
-            *max_bin = 300;
-        }
-        None => {}
-    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -124,24 +93,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             output,
             payload,
             key,
-            mut strength,
-            profile,
+            strength,
             offset_seconds,
             frame_size,
-            mut num_bin_pairs,
-            mut min_bin,
-            mut max_bin,
+            num_bin_pairs,
+            min_freq,
+            max_freq,
         } => {
             if !frame_size.is_power_of_two() {
                 return Err(format!("frame_size must be power of 2, got {frame_size}").into());
             }
-            apply_profile(
-                profile,
-                &mut strength,
-                &mut num_bin_pairs,
-                &mut min_bin,
-                &mut max_bin,
-            );
             let reader = hound::WavReader::open(&input)?;
             let spec = reader.spec();
 
@@ -183,18 +144,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 strength,
                 frame_size,
                 num_bin_pairs,
-                min_bin,
-                max_bin,
+                min_freq_hz: min_freq,
+                max_freq_hz: max_freq,
             };
-            let num_bins = config.num_bins();
-            if config.min_bin >= num_bins || config.max_bin >= num_bins {
-                eprintln!(
-                    "Warning: bin range [{}, {}] exceeds available bins (0..{}). Consider lowering min/max bin.",
-                    config.min_bin,
-                    config.max_bin,
-                    num_bins - 1
-                );
-            }
 
             eprintln!(
                 "Embedding watermark into {} ({} samples, {}Hz)...",
@@ -217,7 +169,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if effective_offset != offset_samples {
                 eprintln!(
-                    "Warning: offset aligned to frame boundary ({} samples ≈ {:.3}s).",
+                    "Warning: offset aligned to frame boundary ({} samples = {:.3}s).",
                     effective_offset,
                     effective_offset as f32 / config.sample_rate as f32
                 );
@@ -227,7 +179,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let needed_samples = frames_per_block * config.frame_size;
                 let needed_seconds = needed_samples as f32 / config.sample_rate as f32;
                 eprintln!(
-                    "Warning: audio is too short for reliable detection ({} frames, need {}). Minimum duration ≈ {:.2}s at {}Hz.",
+                    "Warning: audio is too short for reliable detection ({} frames, need {}). \
+                     Minimum duration = {:.2}s at {}Hz.",
                     num_frames, frames_per_block, needed_seconds, config.sample_rate
                 );
             }
@@ -261,24 +214,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Detect {
             input,
             key,
-            profile,
             offset_seconds,
             frame_size,
-            mut num_bin_pairs,
-            mut min_bin,
-            mut max_bin,
+            num_bin_pairs,
+            min_freq,
+            max_freq,
         } => {
             if !frame_size.is_power_of_two() {
                 return Err(format!("frame_size must be power of 2, got {frame_size}").into());
             }
-            let mut strength = 0.01;
-            apply_profile(
-                profile,
-                &mut strength,
-                &mut num_bin_pairs,
-                &mut min_bin,
-                &mut max_bin,
-            );
             let reader = hound::WavReader::open(&input)?;
             let spec = reader.spec();
 
@@ -308,21 +252,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let wm_key = agua_core::WatermarkKey::from_passphrase(&key);
             let config = agua_core::WatermarkConfig {
                 sample_rate: spec.sample_rate,
-                strength,
+                strength: 0.02,
                 frame_size,
                 num_bin_pairs,
-                min_bin,
-                max_bin,
+                min_freq_hz: min_freq,
+                max_freq_hz: max_freq,
             };
-            let num_bins = config.num_bins();
-            if config.min_bin >= num_bins || config.max_bin >= num_bins {
-                eprintln!(
-                    "Warning: bin range [{}, {}] exceeds available bins (0..{}). Consider lowering min/max bin.",
-                    config.min_bin,
-                    config.max_bin,
-                    num_bins - 1
-                );
-            }
 
             eprintln!(
                 "Detecting watermark in {} ({} samples, {}Hz)...",
@@ -345,7 +280,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if effective_offset != offset_samples {
                 eprintln!(
-                    "Warning: offset aligned to frame boundary ({} samples ≈ {:.3}s).",
+                    "Warning: offset aligned to frame boundary ({} samples = {:.3}s).",
                     effective_offset,
                     effective_offset as f32 / config.sample_rate as f32
                 );
@@ -355,7 +290,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let needed_samples = frames_per_block * config.frame_size;
                 let needed_seconds = needed_samples as f32 / config.sample_rate as f32;
                 eprintln!(
-                    "Warning: audio is too short for reliable detection ({} frames, need {}). Minimum duration ≈ {:.2}s at {}Hz.",
+                    "Warning: audio is too short for reliable detection ({} frames, need {}). \
+                     Minimum duration = {:.2}s at {}Hz.",
                     num_frames, frames_per_block, needed_seconds, config.sample_rate
                 );
             }
