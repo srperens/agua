@@ -1,6 +1,6 @@
 
 
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
 const PROCESS_INTERVAL_MS = 50;
 const MAX_SAMPLES_PER_TICK = 48000; // ~1s at 48kHz — allows catching up if backlog grows
 const MAX_QUEUE_SAMPLES = 48000 * 5; // cap backlog to ~5s to avoid UI slowdown
@@ -52,8 +52,13 @@ const dbgBatch = document.getElementById("dbg-batch");
 const signalWarning = document.getElementById("signal-warning");
 const vuBar = document.getElementById("vu-bar");
 const constraintsInfo = document.getElementById("constraints-info");
+const clearLogBtn = document.getElementById("clear-log-btn");
 
 document.getElementById("version-tag").textContent = `v${VERSION}`;
+
+clearLogBtn.addEventListener("click", () => {
+  detectionLog.innerHTML = "";
+});
 const gainSlider = document.getElementById("gain-slider");
 const gainValue = document.getElementById("gain-value");
 const autoGainToggle = document.getElementById("auto-gain-toggle");
@@ -89,6 +94,7 @@ async function runOfflineDetect(arrayBuf) {
         type: "init",
         key: keyInput.value.trim() || DEFAULT_KEY,
         sampleRate: audioBuf.sampleRate,
+        preprocess: false,
       });
     });
 
@@ -483,10 +489,24 @@ async function enumerateDevices() {
       option.textContent = device.label || `Microphone ${deviceSelect.length}`;
       deviceSelect.appendChild(option);
     }
+
+    // Restore saved device selection
+    const saved = localStorage.getItem("agua-device");
+    if (saved && [...deviceSelect.options].some((o) => o.value === saved)) {
+      deviceSelect.value = saved;
+    }
   } catch (err) {
     console.warn("Could not enumerate devices:", err);
   }
 }
+
+deviceSelect.addEventListener("change", () => {
+  if (deviceSelect.value) {
+    localStorage.setItem("agua-device", deviceSelect.value);
+  } else {
+    localStorage.removeItem("agua-device");
+  }
+});
 
 startBtn.addEventListener("click", start);
 stopBtn.addEventListener("click", stop);

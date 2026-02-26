@@ -281,10 +281,13 @@
   </div>
 
   <div class="card">
-    <div class="label">Detection log</div>
+    <div class="label" style="display:flex;justify-content:space-between;align-items:center;">
+      Detection log
+      <button id="clear-log-btn" style="font-size:0.7rem;padding:0.2rem 0.5rem;background:var(--border);color:var(--text-dim);">Clear</button>
+    </div>
     <div id="detection-log" class="log-section"></div>
   </div>
 
-  <script type="module" src="app.js?v=0.4.0"></script>
+  <script type="module" src="app.js?v=0.5.0"></script>
 </body>
 </html>
