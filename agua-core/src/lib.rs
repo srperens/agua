@@ -8,6 +8,7 @@ pub mod frame;
 pub mod key;
 pub mod patchwork;
 pub mod payload;
+pub mod preprocess;
 pub mod stream;
 pub mod sync;
 
@@ -20,6 +21,7 @@ pub use embed::DetectionResult;
 pub use error::Error;
 pub use key::WatermarkKey;
 pub use payload::Payload;
+pub use preprocess::PreProcessor;
 pub use stream::{StreamDetector, StreamEmbedder};
 
 #[cfg(feature = "parallel")]

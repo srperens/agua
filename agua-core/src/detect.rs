@@ -16,23 +16,273 @@ use crate::sync::{self, SYNC_PATTERN_BITS, correlate_sync, generate_sync_pattern
 /// serves to limit the number of Viterbi decode attempts.
 const SYNC_THRESHOLD: f32 = 0.01;
 
+/// Maximum Viterbi decode attempts to limit cost (K=15 decode is expensive).
+const MAX_DECODE_ATTEMPTS: usize = 5;
+
+/// Coarse sample-offset search step divides hop_size into this many steps.
+/// With hop_size=512, step = 512/16 = 32 samples.
+const COARSE_SEARCH_DIVISOR: usize = 16;
+
+/// Fine sample-offset search step divides hop_size into this many steps.
+/// With hop_size=512, step = 512/64 = 8 samples.
+const FINE_SEARCH_DIVISOR: usize = 64;
+
 /// Detect watermarks in audio samples.
 ///
-/// Processes audio in Hann-windowed overlapping frames (50% overlap),
-/// matching the embedding scheme. Returns all successfully detected
-/// watermark payloads.
+/// Searches for the watermark across multiple sub-frame sample offsets
+/// to handle arbitrary alignment between embedder and detector frame
+/// grids. Uses a two-phase approach:
+///
+/// 1. **Fast path**: try offset 0 (covers the common file-based case)
+/// 2. **Coarse search**: try offsets at `hop/16` steps, running two-pass
+///    detection (sync finding + data decoding) at each
+/// 3. **Fine search**: refine around the best coarse candidate at `hop/64`
 pub fn detect(
     samples: &[f32],
     key: &WatermarkKey,
     config: &WatermarkConfig,
 ) -> Result<Vec<DetectionResult>> {
-    detect_with_offset(samples, key, config, 0)
+    // Fast path: try aligned detection first (covers the common case)
+    if let Ok(results) = detect_with_offset(samples, key, config, 0) {
+        return Ok(results);
+    }
+
+    let hop_size = config.hop_size();
+    let frame_size = config.frame_size;
+    let coarse_step = (hop_size / COARSE_SEARCH_DIVISOR).max(1);
+    let fine_step = (hop_size / FINE_SEARCH_DIVISOR).max(1);
+
+    let sync_pattern = generate_sync_pattern(key);
+    let frames_per_block = sync::frames_per_block();
+    let window = hann_window(frame_size);
+
+    // --- Phase 1: Coarse search ---
+    // At each coarse offset, run two-pass detection: constant-seed sync
+    // finding + block-position-aware data decoding.
+    let mut best_coarse_offset = coarse_step;
+    let mut best_coarse_corr = f32::NEG_INFINITY;
+
+    for i in 1..COARSE_SEARCH_DIVISOR {
+        let sample_offset = i * coarse_step;
+        if sample_offset + frame_size > samples.len() {
+            break;
+        }
+        let buf = &samples[sample_offset..];
+        let num_frames = (buf.len() - frame_size) / hop_size + 1;
+        if num_frames < frames_per_block {
+            continue;
+        }
+
+        // Pass 1: sync soft values with constant seed 0
+        let sync_soft = compute_soft_values_const_seed(buf, key, config, &window, num_frames)?;
+
+        if let Some(result) = try_two_pass_decode(
+            buf,
+            key,
+            config,
+            &window,
+            &sync_soft,
+            num_frames,
+            &sync_pattern,
+            sample_offset,
+        )? {
+            return Ok(vec![result]);
+        }
+
+        // Track best coarse offset for fine search
+        let scan_end = num_frames - frames_per_block;
+        let max_corr = (0..=scan_end)
+            .map(|start| {
+                correlate_sync(&sync_soft[start..start + SYNC_PATTERN_BITS], &sync_pattern)
+            })
+            .fold(f32::NEG_INFINITY, f32::max);
+        if max_corr > best_coarse_corr {
+            best_coarse_corr = max_corr;
+            best_coarse_offset = sample_offset;
+        }
+    }
+
+    // --- Phase 2: Fine search around the best coarse candidate ---
+    let search_start = best_coarse_offset.saturating_sub(coarse_step);
+    let search_end = (best_coarse_offset + coarse_step).min(hop_size);
+
+    let mut off = search_start;
+    while off <= search_end {
+        if !off.is_multiple_of(coarse_step) && off + frame_size <= samples.len() {
+            let buf = &samples[off..];
+            let num_frames = (buf.len() - frame_size) / hop_size + 1;
+            if num_frames >= frames_per_block {
+                let sync_soft =
+                    compute_soft_values_const_seed(buf, key, config, &window, num_frames)?;
+
+                if let Some(result) = try_two_pass_decode(
+                    buf,
+                    key,
+                    config,
+                    &window,
+                    &sync_soft,
+                    num_frames,
+                    &sync_pattern,
+                    off,
+                )? {
+                    return Ok(vec![result]);
+                }
+            }
+        }
+        off += fine_step;
+    }
+
+    Err(Error::NotDetected)
+}
+
+/// Two-pass decode: find sync using constant-seed soft values, then
+/// recompute data soft values with correct block positions for Viterbi.
+#[allow(clippy::too_many_arguments)]
+fn try_two_pass_decode(
+    buf: &[f32],
+    key: &WatermarkKey,
+    config: &WatermarkConfig,
+    window: &[f32],
+    sync_soft: &[f32],
+    num_frames: usize,
+    sync_pattern: &[bool],
+    sample_offset: usize,
+) -> Result<Option<DetectionResult>> {
+    let frames_per_block = sync::frames_per_block();
+    let coded_bits_count = codec::CODED_BITS;
+    let scan_end = num_frames - frames_per_block;
+    let mut candidates: Vec<(usize, f32)> = (0..=scan_end)
+        .map(|start| {
+            let corr = correlate_sync(&sync_soft[start..start + SYNC_PATTERN_BITS], sync_pattern);
+            (start, corr)
+        })
+        .filter(|&(_, corr)| corr > SYNC_THRESHOLD)
+        .collect();
+
+    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(core::cmp::Ordering::Equal));
+
+    for &(start, corr) in candidates.iter().take(MAX_DECODE_ATTEMPTS) {
+        let data_frame_start = start + SYNC_PATTERN_BITS;
+        let data_frame_end = data_frame_start + coded_bits_count;
+        if data_frame_end > num_frames {
+            continue;
+        }
+
+        // Pass 2: recompute data soft values with correct block positions
+        let data_soft =
+            compute_data_soft_values(buf, key, config, window, data_frame_start, coded_bits_count)?;
+
+        let decoded_bits = codec::decode(&data_soft);
+        if let Ok(payload) = Payload::decode_with_crc(&decoded_bits) {
+            return Ok(Some(DetectionResult {
+                payload,
+                confidence: corr,
+                offset: start + sample_offset,
+            }));
+        }
+    }
+
+    // Fallback: try block starting at position 0 (no sync threshold)
+    let data_frame_start = SYNC_PATTERN_BITS;
+    let data_frame_end = data_frame_start + coded_bits_count;
+    if data_frame_end <= num_frames {
+        let data_soft =
+            compute_data_soft_values(buf, key, config, window, data_frame_start, coded_bits_count)?;
+
+        let decoded_bits = codec::decode(&data_soft);
+        if let Ok(payload) = Payload::decode_with_crc(&decoded_bits) {
+            let corr = correlate_sync(&sync_soft[0..SYNC_PATTERN_BITS], sync_pattern);
+            return Ok(Some(DetectionResult {
+                payload,
+                confidence: corr,
+                offset: sample_offset,
+            }));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Compute soft values using constant seed 0 for all frames.
+///
+/// Used for sync pattern finding. Sync frames were embedded with seed 0,
+/// so these soft values are accurate for sync frames and noisy for data frames.
+fn compute_soft_values_const_seed(
+    buf: &[f32],
+    key: &WatermarkKey,
+    config: &WatermarkConfig,
+    window: &[f32],
+    num_frames: usize,
+) -> Result<Vec<f32>> {
+    let hop_size = config.hop_size();
+    let frame_size = config.frame_size;
+    let mut fft = FftProcessor::new(frame_size)?;
+    let mut soft_values = Vec::with_capacity(num_frames);
+
+    for frame_idx in 0..num_frames {
+        let start = frame_idx * hop_size;
+        let end = (start + frame_size).min(buf.len());
+        let mut frame = vec![0.0f32; frame_size];
+        frame[..end - start].copy_from_slice(&buf[start..end]);
+        for (j, s) in frame.iter_mut().enumerate() {
+            *s *= window[j];
+        }
+        fft.forward(&mut frame)?;
+        // Constant seed 0 matches the sync frame embedding seed
+        let soft = patchwork::detect_frame(fft.freq_bins(), key, 0, config);
+        soft_values.push(soft);
+    }
+
+    Ok(soft_values)
+}
+
+/// Compute soft values for data frames using correct block positions.
+///
+/// `data_frame_start` is the local frame index where data begins.
+/// Each data frame `j` uses block position `SYNC_PATTERN_BITS + j` as
+/// the bin pair seed, matching the embedder's seed selection.
+fn compute_data_soft_values(
+    buf: &[f32],
+    key: &WatermarkKey,
+    config: &WatermarkConfig,
+    window: &[f32],
+    data_frame_start: usize,
+    num_data_frames: usize,
+) -> Result<Vec<f32>> {
+    let hop_size = config.hop_size();
+    let frame_size = config.frame_size;
+    let mut fft = FftProcessor::new(frame_size)?;
+    let mut soft_values = Vec::with_capacity(num_data_frames);
+
+    for j in 0..num_data_frames {
+        let frame_idx = data_frame_start + j;
+        let start = frame_idx * hop_size;
+        let end = (start + frame_size).min(buf.len());
+        let mut frame = vec![0.0f32; frame_size];
+        frame[..end - start].copy_from_slice(&buf[start..end]);
+        for (i, s) in frame.iter_mut().enumerate() {
+            *s *= window[i];
+        }
+        fft.forward(&mut frame)?;
+        // Block position for data frame j
+        let block_pos = sync::bin_pair_seed(SYNC_PATTERN_BITS + j);
+        let soft = patchwork::detect_frame(fft.freq_bins(), key, block_pos, config);
+        soft_values.push(soft);
+    }
+
+    Ok(soft_values)
 }
 
 /// Detect watermarks in audio samples starting at a frame offset.
 ///
-/// `frame_offset` specifies the absolute frame index of `samples[0]` in the
-/// original stream, ensuring PRNG bin selection aligns across segments.
+/// Uses a two-pass approach:
+/// 1. Compute soft values with constant seed 0 (accurate for sync frames)
+/// 2. Find sync pattern candidates
+/// 3. Recompute data soft values with correct block-relative seeds
+/// 4. Viterbi decode + CRC validation
+///
+/// `frame_offset` specifies the block-relative position of `samples[0]`
+/// (used when the caller knows the alignment, e.g. from a previous detection).
 pub fn detect_with_offset(
     samples: &[f32],
     key: &WatermarkKey,
@@ -55,95 +305,80 @@ pub fn detect_with_offset(
     let coded_bits_count = codec::CODED_BITS;
 
     let window = hann_window(frame_size);
-    let mut fft = FftProcessor::new(frame_size)?;
-    let mut soft_values = Vec::with_capacity(num_frames);
 
-    for frame_idx in 0..num_frames {
-        let offset = frame_idx * hop_size;
+    // Pass 1: compute soft values with constant seed 0 for sync finding.
+    // Sync frames were embedded with seed 0, so these values are accurate
+    // for sync frames and noisy for data frames.
+    let sync_soft = compute_soft_values_const_seed(samples, key, config, &window, num_frames)?;
 
-        // Extract frame and apply Hann analysis window. While this
-        // attenuates the soft values ~3x vs rectangular, the Hann window
-        // provides superior frequency selectivity that improves
-        // signal-to-noise ratio for the Viterbi decoder.
-        let mut buf = vec![0.0f32; frame_size];
-        let end = (offset + frame_size).min(samples.len());
-        buf[..end - offset].copy_from_slice(&samples[offset..end]);
-        for (i, s) in buf.iter_mut().enumerate() {
-            *s *= window[i];
-        }
-
-        fft.forward(&mut buf)?;
-        let global_frame = frame_offset as usize + frame_idx;
-        let soft = patchwork::detect_frame(fft.freq_bins(), key, global_frame as u32, config);
-        soft_values.push(soft);
+    if num_frames < frames_per_block {
+        return Err(Error::NotDetected);
     }
 
-    let mut results = Vec::new();
+    // Find sync candidates
+    let scan_end = num_frames - frames_per_block;
+    let mut candidates: Vec<(usize, f32)> = (0..=scan_end)
+        .map(|start| {
+            let corr = correlate_sync(&sync_soft[start..start + SYNC_PATTERN_BITS], &sync_pattern);
+            (start, corr)
+        })
+        .filter(|&(_, corr)| corr > SYNC_THRESHOLD)
+        .collect();
 
-    // Maximum Viterbi decode attempts to limit cost (K=15 decode is expensive).
-    const MAX_DECODE_ATTEMPTS: usize = 5;
+    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    if num_frames >= frames_per_block {
-        // Compute sync correlation at every valid position, then try
-        // Viterbi decoding at the best candidates (best-first search).
-        let scan_end = num_frames - frames_per_block;
-        let mut candidates: Vec<(usize, f32)> = (0..=scan_end)
-            .map(|start| {
-                let sync_soft = &soft_values[start..start + SYNC_PATTERN_BITS];
-                let corr = correlate_sync(sync_soft, &sync_pattern);
-                (start, corr)
-            })
-            .filter(|&(_, corr)| corr > SYNC_THRESHOLD)
-            .collect();
-
-        // Sort by correlation descending (best candidates first)
-        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        for &(start, corr) in candidates.iter().take(MAX_DECODE_ATTEMPTS) {
-            let data_start = start + SYNC_PATTERN_BITS;
-            let data_end = data_start + coded_bits_count;
-            if data_end > num_frames {
-                continue;
-            }
-
-            let data_soft = &soft_values[data_start..data_end];
-            let decoded_bits = codec::decode(data_soft);
-
-            if let Ok(payload) = Payload::decode_with_crc(&decoded_bits) {
-                results.push(DetectionResult {
-                    payload,
-                    confidence: corr,
-                    offset: start + frame_offset as usize,
-                });
-                break;
-            }
+    // Pass 2: recompute data soft values at the best sync candidates
+    for &(start, corr) in candidates.iter().take(MAX_DECODE_ATTEMPTS) {
+        let data_frame_start = start + SYNC_PATTERN_BITS;
+        let data_frame_end = data_frame_start + coded_bits_count;
+        if data_frame_end > num_frames {
+            continue;
         }
 
-        // Fallback: try offset 0 directly (no sync threshold)
-        if results.is_empty() {
-            let data_start = SYNC_PATTERN_BITS;
-            let data_end = data_start + coded_bits_count;
-            if data_end <= num_frames {
-                let data_soft = &soft_values[data_start..data_end];
-                let decoded_bits = codec::decode(data_soft);
-                if let Ok(payload) = Payload::decode_with_crc(&decoded_bits) {
-                    let sync_soft = &soft_values[0..SYNC_PATTERN_BITS];
-                    let corr = correlate_sync(sync_soft, &sync_pattern);
-                    results.push(DetectionResult {
-                        payload,
-                        confidence: corr,
-                        offset: frame_offset as usize,
-                    });
-                }
-            }
+        let data_soft = compute_data_soft_values(
+            samples,
+            key,
+            config,
+            &window,
+            data_frame_start,
+            coded_bits_count,
+        )?;
+
+        let decoded_bits = codec::decode(&data_soft);
+        if let Ok(payload) = Payload::decode_with_crc(&decoded_bits) {
+            return Ok(vec![DetectionResult {
+                payload,
+                confidence: corr,
+                offset: start + frame_offset as usize,
+            }]);
         }
     }
 
-    if results.is_empty() {
-        Err(Error::NotDetected)
-    } else {
-        Ok(results)
+    // Fallback: try block starting at position 0 directly (no sync threshold)
+    let data_frame_start = SYNC_PATTERN_BITS;
+    let data_frame_end = data_frame_start + coded_bits_count;
+    if data_frame_end <= num_frames {
+        let data_soft = compute_data_soft_values(
+            samples,
+            key,
+            config,
+            &window,
+            data_frame_start,
+            coded_bits_count,
+        )?;
+
+        let decoded_bits = codec::decode(&data_soft);
+        if let Ok(payload) = Payload::decode_with_crc(&decoded_bits) {
+            let corr = correlate_sync(&sync_soft[0..SYNC_PATTERN_BITS], &sync_pattern);
+            return Ok(vec![DetectionResult {
+                payload,
+                confidence: corr,
+                offset: frame_offset as usize,
+            }]);
+        }
     }
+
+    Err(Error::NotDetected)
 }
 
 #[cfg(test)]

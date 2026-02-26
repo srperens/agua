@@ -41,6 +41,19 @@ impl WatermarkConfig {
         }
     }
 
+    /// Configuration tuned for the acoustic channel (speaker → air → mic).
+    ///
+    /// Uses strength `0.08` to overcome the severe degradation of the
+    /// acoustic path: room reverberation, speaker/mic frequency response,
+    /// AGC, and ambient noise. More audible than `robust()` but necessary
+    /// for reliable detection through air.
+    pub fn acoustic() -> Self {
+        Self {
+            strength: 0.08,
+            ..Self::default()
+        }
+    }
+
     /// Number of complex frequency bins (frame_size / 2 + 1).
     pub fn num_bins(&self) -> usize {
         self.frame_size / 2 + 1

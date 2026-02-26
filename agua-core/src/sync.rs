@@ -80,6 +80,20 @@ pub fn frames_per_block() -> usize {
     SYNC_PATTERN_BITS + CODED_BITS
 }
 
+/// Compute the bin pair PRNG seed for a given block-relative position.
+///
+/// Sync frames (positions 0..SYNC_PATTERN_BITS) use constant seed 0 so the
+/// detector can find the sync pattern without knowing block alignment.
+/// Data frames use their block position for per-frame frequency diversity,
+/// which is critical for robust Viterbi decoding across all keys.
+pub fn bin_pair_seed(block_position: usize) -> u32 {
+    if block_position < SYNC_PATTERN_BITS {
+        0
+    } else {
+        block_position as u32
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

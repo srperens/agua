@@ -6,7 +6,7 @@ use crate::frame::hann_window;
 use crate::key::WatermarkKey;
 use crate::patchwork;
 use crate::payload::Payload;
-use crate::sync::{self, SYNC_PATTERN_BITS, correlate_sync, generate_sync_pattern};
+use crate::sync::{self, generate_sync_pattern};
 
 /// Streaming watermark embedder.
 ///
@@ -90,11 +90,12 @@ impl StreamEmbedder {
 
             let bit_idx = self.frame_counter % self.block_bits.len();
             let bit = self.block_bits[bit_idx];
+            let bin_pair_seed = sync::bin_pair_seed(bit_idx);
             patchwork::embed_frame(
                 self.fft.freq_bins_mut(),
                 bit,
                 &self.key,
-                self.frame_counter as u32,
+                bin_pair_seed,
                 &self.config,
             );
 
@@ -154,121 +155,128 @@ impl StreamEmbedder {
     }
 }
 
-/// Streaming watermark detector.
+/// Streaming watermark detector with sliding-window sync search.
 ///
 /// Accepts arbitrary-length input chunks and reports detected watermarks.
-/// Uses Hann-windowed overlapping frames (50% overlap) matching the
-/// embedding scheme.
+/// Internally buffers raw audio samples and periodically runs batch
+/// detection, delegating to the one-shot `detect()` function which handles:
+/// 1. Arbitrary block boundary (sync search via sliding window)
+/// 2. Arbitrary sub-frame sample alignment (multi-offset search)
+///
+/// This enables detection when the mic starts recording at any point
+/// in the watermarked stream (e.g. speaker → air → mic path).
 pub struct StreamDetector {
     config: WatermarkConfig,
     key: WatermarkKey,
-    fft: FftProcessor,
-    window: Vec<f32>,
-    sync_pattern: Vec<bool>,
     frames_per_block: usize,
-    coded_bits_count: usize,
-    input_buf: Vec<f32>,
-    soft_values: Vec<f32>,
-    frame_counter: usize,
+    /// Raw audio sample buffer.
+    audio_buf: Vec<f32>,
+    /// Maximum audio buffer size in samples.
+    max_buf_samples: usize,
+    /// Samples needed for one full block of frames.
+    block_samples: usize,
+    /// Total samples consumed (for offset reporting).
+    total_samples_consumed: usize,
 }
 
 impl StreamDetector {
     /// Create a new streaming detector.
     pub fn new(key: &WatermarkKey, config: &WatermarkConfig) -> crate::error::Result<Self> {
-        let fft = FftProcessor::new(config.frame_size)?;
-        let window = hann_window(config.frame_size);
-        let sync_pattern = generate_sync_pattern(key);
+        // Validate config by constructing an FftProcessor (checks frame_size).
+        let _ = FftProcessor::new(config.frame_size)?;
         let frames_per_block = sync::frames_per_block();
-        let coded_bits_count = codec::CODED_BITS;
+        let hop_size = config.hop_size();
+        // Samples needed to produce frames_per_block frames.
+        let block_samples = (frames_per_block - 1) * hop_size + config.frame_size;
+        // Buffer up to 2 blocks to allow sync search.
+        let max_buf_samples = 2 * block_samples;
 
         Ok(Self {
             config: config.clone(),
             key: key.clone(),
-            fft,
-            window,
-            sync_pattern,
             frames_per_block,
-            coded_bits_count,
-            input_buf: Vec::new(),
-            soft_values: Vec::new(),
-            frame_counter: 0,
+            audio_buf: Vec::new(),
+            max_buf_samples,
+            block_samples,
+            total_samples_consumed: 0,
         })
     }
 
     /// Process input samples and return any detected watermarks.
     pub fn process(&mut self, input: &[f32]) -> Vec<DetectionResult> {
-        self.input_buf.extend_from_slice(input);
-        let frame_size = self.config.frame_size;
-        let hop_size = self.config.hop_size();
+        self.audio_buf.extend_from_slice(input);
+
         let mut results = Vec::new();
-
-        while self.input_buf.len() >= frame_size {
-            // Extract frame_size samples and apply Hann analysis window
-            let mut buf = self.input_buf[..frame_size].to_vec();
-            for (i, s) in buf.iter_mut().enumerate() {
-                *s *= self.window[i];
-            }
-
-            self.fft
-                .forward(&mut buf)
-                .expect("buffer size matches frame_size");
-            let soft = patchwork::detect_frame(
-                self.fft.freq_bins(),
-                &self.key,
-                self.frame_counter as u32,
-                &self.config,
-            );
-            self.soft_values.push(soft);
-            self.frame_counter += 1;
-
-            // Check if we have enough soft values for a full block
-            if self.soft_values.len() >= self.frames_per_block
-                && let Some(result) = self.try_detect()
-            {
+        // Try detection when we have at least 1.25 blocks of audio.
+        let scan_threshold = self.block_samples + self.block_samples / 4;
+        while self.audio_buf.len() >= scan_threshold {
+            if let Some(result) = self.try_detect_batch() {
                 results.push(result);
-                self.soft_values.clear();
+            } else {
+                // No detection — advance past half a block to avoid re-scanning
+                let advance = self.block_samples / 2;
+                let drain = advance.min(self.audio_buf.len());
+                self.audio_buf.drain(..drain);
+                self.total_samples_consumed += drain;
+                break;
             }
+        }
 
-            // Advance input by hop_size (not frame_size)
-            self.input_buf.drain(..hop_size);
+        // Trim buffer if it exceeds max size
+        if self.audio_buf.len() > self.max_buf_samples {
+            let excess = self.audio_buf.len() - self.max_buf_samples;
+            self.audio_buf.drain(..excess);
+            self.total_samples_consumed += excess;
         }
 
         results
     }
 
-    fn try_detect(&self) -> Option<DetectionResult> {
-        let n = self.soft_values.len();
-        if n < self.frames_per_block {
-            return None;
+    /// Run one-shot detection on the audio buffer. The `detect()` function
+    /// handles both sync search and sub-frame alignment internally.
+    fn try_detect_batch(&mut self) -> Option<DetectionResult> {
+        let hop_size = self.config.hop_size();
+
+        if let Ok(det_results) = crate::detect::detect(&self.audio_buf, &self.key, &self.config)
+            && let Some(result) = det_results.into_iter().next()
+        {
+            // Drain buffer past the detected block
+            let block_end_frames = result.offset + self.frames_per_block;
+            let block_end_samples = (block_end_frames - 1) * hop_size + self.config.frame_size;
+            let drain = block_end_samples.min(self.audio_buf.len());
+            self.audio_buf.drain(..drain);
+            self.total_samples_consumed += drain;
+
+            return Some(DetectionResult {
+                payload: result.payload,
+                confidence: result.confidence,
+                offset: self.total_samples_consumed,
+            });
         }
+        None
+    }
 
-        // Try detection at offset 0
-        let sync_soft = &self.soft_values[0..SYNC_PATTERN_BITS];
-        let corr = correlate_sync(sync_soft, &self.sync_pattern);
-
-        let data_start = SYNC_PATTERN_BITS;
-        let data_end = data_start + self.coded_bits_count;
-        if data_end > n {
-            return None;
-        }
-
-        let data_soft = &self.soft_values[data_start..data_end];
-        let decoded_bits = codec::decode(data_soft);
-
-        if let Ok(payload) = Payload::decode_with_crc(&decoded_bits) {
-            Some(DetectionResult {
-                payload,
-                confidence: corr,
-                offset: self.frame_counter - n,
-            })
+    /// Finalize detection with any remaining buffered data.
+    pub fn finalize(&mut self) -> Option<DetectionResult> {
+        if self.audio_buf.len() >= self.block_samples {
+            self.try_detect_batch()
         } else {
             None
         }
     }
 
-    /// Finalize detection with any remaining buffered data.
-    pub fn finalize(&self) -> Option<DetectionResult> {
-        self.try_detect()
+    /// How full the detection buffer is, as a fraction (0.0 to 1.0).
+    ///
+    /// Returns the ratio of buffered audio to the samples needed for one
+    /// complete watermark block.
+    pub fn buffer_fill(&self) -> f32 {
+        (self.audio_buf.len() as f32 / self.block_samples as f32).min(1.0)
+    }
+
+    /// Reset the detector state, clearing all buffered data.
+    pub fn reset(&mut self) {
+        self.audio_buf.clear();
+        self.total_samples_consumed = 0;
     }
 }
 
@@ -311,5 +319,149 @@ mod tests {
         output.extend(embedder.flush());
 
         assert!(!output.is_empty(), "streaming embedder produced no output");
+    }
+
+    /// Helper: embed a watermark using one-shot API and return the watermarked audio.
+    fn embed_test_audio(
+        config: &WatermarkConfig,
+        key: &WatermarkKey,
+        payload: &Payload,
+        duration_secs: usize,
+    ) -> Vec<f32> {
+        let num_samples = config.sample_rate as usize * duration_secs;
+        let mut audio = make_test_audio(num_samples, config.sample_rate);
+        crate::embed::embed(&mut audio, payload, key, config).unwrap();
+        audio
+    }
+
+    #[test]
+    fn stream_detector_with_offset() {
+        let config = WatermarkConfig {
+            strength: 0.05,
+            ..WatermarkConfig::default()
+        };
+        let key = WatermarkKey::new(&[42u8; 16]).unwrap();
+        let payload = Payload::new([
+            0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC,
+            0xBA, 0x98,
+        ]);
+
+        // Embed into 30s of audio (enough for 2+ blocks)
+        let watermarked = embed_test_audio(&config, &key, &payload, 30);
+
+        // Start detection from ~3 seconds into the watermarked audio.
+        // This simulates a mic starting to capture an already-playing
+        // watermarked stream at an arbitrary sample offset.
+        let offset = 48000 * 3; // 144000 samples — NOT hop-aligned
+        let offset_audio = &watermarked[offset..];
+
+        // Feed in small 128-sample chunks to StreamDetector
+        let mut detector = StreamDetector::new(&key, &config).unwrap();
+        let mut results = Vec::new();
+        for chunk in offset_audio.chunks(128) {
+            results.extend(detector.process(chunk));
+        }
+        if let Some(r) = detector.finalize() {
+            results.push(r);
+        }
+
+        assert!(
+            !results.is_empty(),
+            "StreamDetector failed to detect watermark with offset"
+        );
+        assert_eq!(results[0].payload, payload, "payload mismatch");
+    }
+
+    #[test]
+    fn stream_detector_continuous_blocks() {
+        let config = WatermarkConfig {
+            strength: 0.05,
+            ..WatermarkConfig::default()
+        };
+        let key = WatermarkKey::new(&[42u8; 16]).unwrap();
+        let payload = Payload::new([
+            0xCA, 0xFE, 0xBA, 0xBE, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x11, 0x22,
+            0x33, 0x44,
+        ]);
+
+        // 30s should contain ~2 full blocks
+        let watermarked = embed_test_audio(&config, &key, &payload, 30);
+
+        let mut detector = StreamDetector::new(&key, &config).unwrap();
+        let mut results = Vec::new();
+        for chunk in watermarked.chunks(4096) {
+            results.extend(detector.process(chunk));
+        }
+        if let Some(r) = detector.finalize() {
+            results.push(r);
+        }
+
+        assert!(
+            !results.is_empty(),
+            "StreamDetector failed to detect in 30s"
+        );
+        for r in &results {
+            assert_eq!(
+                r.payload, payload,
+                "payload mismatch in continuous detection"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_detector_bounded_memory() {
+        let config = WatermarkConfig::default();
+        let key = WatermarkKey::new(&[42u8; 16]).unwrap();
+
+        // Feed unwatermarked audio for ~40s (several block durations)
+        let audio = make_test_audio(48000 * 40, config.sample_rate);
+
+        let mut detector = StreamDetector::new(&key, &config).unwrap();
+        for chunk in audio.chunks(4096) {
+            let _ = detector.process(chunk);
+        }
+
+        // Buffer should be bounded to max_buf_samples
+        assert!(
+            detector.audio_buf.len() <= detector.max_buf_samples,
+            "buffer grew unbounded: {} > {}",
+            detector.audio_buf.len(),
+            detector.max_buf_samples
+        );
+    }
+
+    #[test]
+    fn stream_detector_matches_batch() {
+        let config = WatermarkConfig {
+            strength: 0.05,
+            ..WatermarkConfig::default()
+        };
+        let key = WatermarkKey::new(&[42u8; 16]).unwrap();
+        let payload = Payload::new([0x55; 16]);
+
+        let watermarked = embed_test_audio(&config, &key, &payload, 20);
+
+        // One-shot detection
+        let batch_results = crate::detect::detect(&watermarked, &key, &config).unwrap();
+        assert!(!batch_results.is_empty());
+
+        // Streaming detection
+        let mut detector = StreamDetector::new(&key, &config).unwrap();
+        let mut stream_results = Vec::new();
+        for chunk in watermarked.chunks(4096) {
+            stream_results.extend(detector.process(chunk));
+        }
+        if let Some(r) = detector.finalize() {
+            stream_results.push(r);
+        }
+
+        assert!(
+            !stream_results.is_empty(),
+            "streaming detector found nothing"
+        );
+        assert_eq!(
+            batch_results[0].payload, stream_results[0].payload,
+            "batch and streaming payloads differ"
+        );
     }
 }

@@ -6,7 +6,7 @@ use crate::frame::hann_window;
 use crate::key::WatermarkKey;
 use crate::patchwork;
 use crate::payload::Payload;
-use crate::sync::generate_sync_pattern;
+use crate::sync::{self, generate_sync_pattern};
 
 /// Embed a watermark into audio samples (in-place).
 ///
@@ -81,7 +81,11 @@ pub fn embed_with_offset(
 
         // FFT -> modify bins -> IFFT -> normalize
         fft.forward(&mut buf)?;
-        patchwork::embed_frame(fft.freq_bins_mut(), bit, key, global_frame as u32, config);
+        // Sync frames use constant seed 0 so the detector can find them
+        // without knowing the block position. Data frames use block-relative
+        // position for frequency diversity across frames.
+        let bin_pair_seed = sync::bin_pair_seed(bit_idx);
+        patchwork::embed_frame(fft.freq_bins_mut(), bit, key, bin_pair_seed, config);
         fft.inverse(&mut buf)?;
         fft.normalize(&mut buf);
 
