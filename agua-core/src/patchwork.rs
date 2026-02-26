@@ -22,7 +22,13 @@ pub fn embed_frame(
     // is critical for robust detection across all keys. The frame_index
     // should be the block-relative position (0..block_len-1) so that the
     // detector can reconstruct the correct seed after finding the sync.
-    let pairs = key.generate_bin_pairs(frame_index, config.num_bin_pairs, min_bin, max_bin);
+    let pairs = key.generate_bin_pairs(
+        frame_index,
+        config.num_bin_pairs,
+        min_bin,
+        max_bin,
+        config.bin_spacing,
+    );
     let delta = config.strength;
 
     for (a, b) in pairs {
@@ -67,7 +73,13 @@ pub fn detect_frame(
     // embedder's block-relative position, this gives accurate soft values.
     // When using constant seed 0 (for sync finding), soft values are
     // noisier but still usable for sync correlation.
-    let pairs = key.generate_bin_pairs(frame_index, config.num_bin_pairs, min_bin, max_bin);
+    let pairs = key.generate_bin_pairs(
+        frame_index,
+        config.num_bin_pairs,
+        min_bin,
+        max_bin,
+        config.bin_spacing,
+    );
 
     let mut sum = 0.0f32;
     let mut count = 0usize;

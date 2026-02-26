@@ -51,6 +51,10 @@ enum Command {
         /// Maximum frequency in Hz for watermark embedding
         #[arg(long, default_value = "4300.0")]
         max_freq: f32,
+
+        /// Bin spacing within each frequency pair (1 = adjacent)
+        #[arg(long, default_value = "4")]
+        bin_spacing: usize,
     },
     /// Detect a watermark in a WAV file
     Detect {
@@ -82,6 +86,10 @@ enum Command {
         #[arg(long, default_value = "4300.0")]
         max_freq: f32,
 
+        /// Bin spacing within each frequency pair (1 = adjacent)
+        #[arg(long, default_value = "4")]
+        bin_spacing: usize,
+
         /// Show debug diagnostics (sync correlations, soft values) on failure
         #[arg(short, long)]
         verbose: bool,
@@ -103,6 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             num_bin_pairs,
             min_freq,
             max_freq,
+            bin_spacing,
         } => {
             if !frame_size.is_power_of_two() {
                 return Err(format!("frame_size must be power of 2, got {frame_size}").into());
@@ -150,6 +159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 num_bin_pairs,
                 min_freq_hz: min_freq,
                 max_freq_hz: max_freq,
+                bin_spacing,
             };
 
             eprintln!(
@@ -223,6 +233,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             num_bin_pairs,
             min_freq,
             max_freq,
+            bin_spacing,
             verbose,
         } => {
             if !frame_size.is_power_of_two() {
@@ -262,6 +273,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 num_bin_pairs,
                 min_freq_hz: min_freq,
                 max_freq_hz: max_freq,
+                bin_spacing,
             };
 
             eprintln!(

@@ -17,6 +17,7 @@ pub mod parallel;
 
 // Re-export primary API types
 pub use config::WatermarkConfig;
+pub use detect::DetectionDiagnostics;
 pub use embed::DetectionResult;
 pub use error::Error;
 pub use key::WatermarkKey;
@@ -61,6 +62,15 @@ pub fn detect(
     config: &WatermarkConfig,
 ) -> error::Result<Vec<DetectionResult>> {
     detect::detect(samples, key, config)
+}
+
+/// Detect watermarks with diagnostics (sync correlation, candidate counts, etc.).
+pub fn detect_with_diagnostics(
+    samples: &[f32],
+    key: &WatermarkKey,
+    config: &WatermarkConfig,
+) -> (error::Result<Vec<DetectionResult>>, DetectionDiagnostics) {
+    detect::detect_with_diagnostics(samples, key, config)
 }
 
 /// Detect watermarks in audio samples starting at a frame offset.

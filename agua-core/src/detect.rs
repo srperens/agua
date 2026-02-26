@@ -14,7 +14,7 @@ use crate::sync::{self, SYNC_PATTERN_BITS, correlate_sync, generate_sync_pattern
 /// Kept low because the CRC-32 check after Viterbi decoding provides the
 /// real false-positive rejection (probability ~2^-32). The threshold only
 /// serves to limit the number of Viterbi decode attempts.
-const SYNC_THRESHOLD: f32 = 0.01;
+const SYNC_THRESHOLD: f32 = 0.02;
 
 /// Maximum Viterbi decode attempts to limit cost (K=15 decode is expensive).
 const MAX_DECODE_ATTEMPTS: usize = 5;
@@ -26,6 +26,21 @@ const COARSE_SEARCH_DIVISOR: usize = 16;
 /// Fine sample-offset search step divides hop_size into this many steps.
 /// With hop_size=512, step = 512/64 = 8 samples.
 const FINE_SEARCH_DIVISOR: usize = 64;
+
+/// Diagnostics from a detection attempt.
+#[derive(Debug, Clone, Default)]
+pub struct DetectionDiagnostics {
+    /// Best sync correlation found across all offsets/candidates.
+    pub best_sync_corr: f32,
+    /// Total sync candidates above threshold across all offsets.
+    pub sync_candidates: u32,
+    /// Number of offsets searched.
+    pub offsets_searched: u32,
+    /// Number of Viterbi decode attempts.
+    pub viterbi_attempts: u32,
+    /// Whether the fast path (offset 0) was tried.
+    pub fast_path_tried: bool,
+}
 
 /// Detect watermarks in audio samples.
 ///
@@ -133,6 +148,260 @@ pub fn detect(
     }
 
     Err(Error::NotDetected)
+}
+
+/// Like `detect()` but also returns diagnostics about the search.
+pub fn detect_with_diagnostics(
+    samples: &[f32],
+    key: &WatermarkKey,
+    config: &WatermarkConfig,
+) -> (core::result::Result<Vec<DetectionResult>, Error>, DetectionDiagnostics) {
+    let mut diag = DetectionDiagnostics {
+        fast_path_tried: true,
+        ..DetectionDiagnostics::default()
+    };
+
+    // Fast path: try aligned detection first
+    if let Ok(results) = detect_with_offset(samples, key, config, 0) {
+        if let Some(r) = results.first() {
+            diag.best_sync_corr = r.confidence;
+            diag.sync_candidates = 1;
+            diag.viterbi_attempts = 1;
+        }
+        return (Ok(results), diag);
+    }
+
+    let hop_size = config.hop_size();
+    let frame_size = config.frame_size;
+    let coarse_step = (hop_size / COARSE_SEARCH_DIVISOR).max(1);
+    let fine_step = (hop_size / FINE_SEARCH_DIVISOR).max(1);
+
+    let sync_pattern = generate_sync_pattern(key);
+    let frames_per_block = sync::frames_per_block();
+    let window = hann_window(frame_size);
+
+    let mut best_coarse_offset = coarse_step;
+    let mut best_coarse_corr = f32::NEG_INFINITY;
+
+    for i in 1..COARSE_SEARCH_DIVISOR {
+        let sample_offset = i * coarse_step;
+        if sample_offset + frame_size > samples.len() {
+            break;
+        }
+        let buf = &samples[sample_offset..];
+        let num_frames = (buf.len() - frame_size) / hop_size + 1;
+        if num_frames < frames_per_block {
+            continue;
+        }
+        diag.offsets_searched += 1;
+
+        let sync_soft = match compute_soft_values_const_seed(buf, key, config, &window, num_frames)
+        {
+            Ok(s) => s,
+            Err(e) => return (Err(e), diag),
+        };
+
+        // Count candidates at this offset
+        let scan_end = num_frames - frames_per_block;
+        let candidates_here: Vec<(usize, f32)> = (0..=scan_end)
+            .map(|start| {
+                let corr =
+                    correlate_sync(&sync_soft[start..start + SYNC_PATTERN_BITS], &sync_pattern);
+                (start, corr)
+            })
+            .filter(|&(_, corr)| corr > SYNC_THRESHOLD)
+            .collect();
+
+        for &(_, corr) in &candidates_here {
+            if corr > diag.best_sync_corr {
+                diag.best_sync_corr = corr;
+            }
+        }
+        diag.sync_candidates += candidates_here.len() as u32;
+        diag.viterbi_attempts += candidates_here.len().min(MAX_DECODE_ATTEMPTS) as u32;
+
+        if let Ok(Some(result)) = try_two_pass_decode(
+            buf,
+            key,
+            config,
+            &window,
+            &sync_soft,
+            num_frames,
+            &sync_pattern,
+            sample_offset,
+        ) {
+            return (Ok(vec![result]), diag);
+        }
+
+        let max_corr = (0..=scan_end)
+            .map(|start| {
+                correlate_sync(&sync_soft[start..start + SYNC_PATTERN_BITS], &sync_pattern)
+            })
+            .fold(f32::NEG_INFINITY, f32::max);
+        if max_corr > best_coarse_corr {
+            best_coarse_corr = max_corr;
+            best_coarse_offset = sample_offset;
+        }
+    }
+
+    // Fine search
+    let search_start = best_coarse_offset.saturating_sub(coarse_step);
+    let search_end = (best_coarse_offset + coarse_step).min(hop_size);
+    let mut off = search_start;
+    while off <= search_end {
+        if !off.is_multiple_of(coarse_step) && off + frame_size <= samples.len() {
+            let buf = &samples[off..];
+            let num_frames = (buf.len() - frame_size) / hop_size + 1;
+            if num_frames >= frames_per_block {
+                diag.offsets_searched += 1;
+                let sync_soft = match compute_soft_values_const_seed(
+                    buf, key, config, &window, num_frames,
+                ) {
+                    Ok(s) => s,
+                    Err(e) => return (Err(e), diag),
+                };
+
+                let scan_end = num_frames - frames_per_block;
+                let candidates_here: Vec<(usize, f32)> = (0..=scan_end)
+                    .map(|start| {
+                        let corr = correlate_sync(
+                            &sync_soft[start..start + SYNC_PATTERN_BITS],
+                            &sync_pattern,
+                        );
+                        (start, corr)
+                    })
+                    .filter(|&(_, corr)| corr > SYNC_THRESHOLD)
+                    .collect();
+
+                for &(_, corr) in &candidates_here {
+                    if corr > diag.best_sync_corr {
+                        diag.best_sync_corr = corr;
+                    }
+                }
+                diag.sync_candidates += candidates_here.len() as u32;
+                diag.viterbi_attempts += candidates_here.len().min(MAX_DECODE_ATTEMPTS) as u32;
+
+                if let Ok(Some(result)) = try_two_pass_decode(
+                    buf,
+                    key,
+                    config,
+                    &window,
+                    &sync_soft,
+                    num_frames,
+                    &sync_pattern,
+                    off,
+                ) {
+                    return (Ok(vec![result]), diag);
+                }
+            }
+        }
+        off += fine_step;
+    }
+
+    (Err(Error::NotDetected), diag)
+}
+
+/// Fast single-offset detection with diagnostics for streaming use.
+///
+/// Only checks offset 0 (no multi-offset search). Much faster than
+/// `detect_with_diagnostics` — suitable for WASM/real-time where the
+/// caller provides offset diversity over time via buffer sliding.
+pub fn detect_single_offset_with_diagnostics(
+    samples: &[f32],
+    key: &WatermarkKey,
+    config: &WatermarkConfig,
+) -> (core::result::Result<Vec<DetectionResult>, Error>, DetectionDiagnostics) {
+    let mut diag = DetectionDiagnostics {
+        fast_path_tried: true,
+        offsets_searched: 1,
+        ..DetectionDiagnostics::default()
+    };
+
+    let frame_size = config.frame_size;
+    if samples.len() < frame_size {
+        return (
+            Err(Error::AudioTooShort {
+                needed: frame_size,
+                got: samples.len(),
+            }),
+            diag,
+        );
+    }
+
+    let hop_size = config.hop_size();
+    let num_frames = (samples.len() - frame_size) / hop_size + 1;
+    let sync_pattern = generate_sync_pattern(key);
+    let frames_per_block = sync::frames_per_block();
+    let coded_bits_count = codec::CODED_BITS;
+
+    if num_frames < frames_per_block {
+        return (Err(Error::NotDetected), diag);
+    }
+
+    let window = hann_window(frame_size);
+    let sync_soft = match compute_soft_values_const_seed(samples, key, config, &window, num_frames)
+    {
+        Ok(s) => s,
+        Err(e) => return (Err(e), diag),
+    };
+
+    // Find sync candidates
+    let scan_end = num_frames - frames_per_block;
+    let mut candidates: Vec<(usize, f32)> = (0..=scan_end)
+        .map(|start| {
+            let corr =
+                correlate_sync(&sync_soft[start..start + SYNC_PATTERN_BITS], &sync_pattern);
+            (start, corr)
+        })
+        .filter(|&(_, corr)| corr > SYNC_THRESHOLD)
+        .collect();
+
+    for &(_, corr) in &candidates {
+        if corr > diag.best_sync_corr {
+            diag.best_sync_corr = corr;
+        }
+    }
+    diag.sync_candidates = candidates.len() as u32;
+
+    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(core::cmp::Ordering::Equal));
+
+    // Limit Viterbi attempts (expensive with K=15)
+    let max_attempts = MAX_DECODE_ATTEMPTS.min(5);
+    diag.viterbi_attempts = candidates.len().min(max_attempts) as u32;
+
+    for &(start, corr) in candidates.iter().take(max_attempts) {
+        let data_frame_start = start + SYNC_PATTERN_BITS;
+        let data_frame_end = data_frame_start + coded_bits_count;
+        if data_frame_end > num_frames {
+            continue;
+        }
+
+        let data_soft = match compute_data_soft_values(
+            samples,
+            key,
+            config,
+            &window,
+            data_frame_start,
+            coded_bits_count,
+        ) {
+            Ok(s) => s,
+            Err(e) => return (Err(e), diag),
+        };
+
+        let decoded_bits = codec::decode(&data_soft);
+        if let Ok(payload) = Payload::decode_with_crc(&decoded_bits) {
+            return (
+                Ok(vec![DetectionResult {
+                    payload,
+                    confidence: corr,
+                    offset: start,
+                }]),
+                diag,
+            );
+        }
+    }
+
+    (Err(Error::NotDetected), diag)
 }
 
 /// Two-pass decode: find sync using constant-seed soft values, then

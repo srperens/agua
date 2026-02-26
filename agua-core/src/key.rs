@@ -50,9 +50,10 @@ impl WatermarkKey {
 
     /// Generate pseudo-random bin pairs for a given frame index.
     ///
-    /// Uses adjacent-bin pairing: each pair consists of bins (k, k+1) where k is
-    /// randomly selected. Adjacent bins have similar magnitudes, which minimizes
-    /// natural spectral asymmetry and maximizes watermark signal-to-noise ratio.
+    /// Each pair consists of bins `(k, k + bin_spacing)` where `k` is randomly
+    /// selected. With `bin_spacing = 1` (default), this gives adjacent-bin
+    /// pairing for maximum SNR. Larger spacing improves resilience to comb
+    /// filtering at the cost of slightly noisier soft values.
     /// The key determines which bin is "a" vs "b" in each pair.
     pub fn generate_bin_pairs(
         &self,
@@ -60,16 +61,17 @@ impl WatermarkKey {
         num_pairs: usize,
         min_bin: usize,
         max_bin: usize,
+        bin_spacing: usize,
     ) -> Vec<(usize, usize)> {
         let bin_range = max_bin - min_bin;
-        if bin_range < 2 {
+        if bin_range <= bin_spacing {
             return Vec::new();
         }
 
         let mut pairs = Vec::with_capacity(num_pairs);
         let mut counter: u32 = 0;
-        // Range for center bin: [min_bin, max_bin - 1) so that center+1 < max_bin
-        let center_range = bin_range - 1;
+        // Range for center bin: [min_bin, max_bin - spacing) so that center+spacing < max_bin
+        let center_range = bin_range - bin_spacing;
 
         while pairs.len() < num_pairs {
             // Build a 16-byte input block: [frame_index(4) | counter(4) | padding(8)]
@@ -91,9 +93,9 @@ impl WatermarkKey {
                     (u16::from_le_bytes([chunk[0], chunk[1]]) as usize) % center_range + min_bin;
                 let swap = chunk[2] & 1 == 1;
                 if swap {
-                    pairs.push((center + 1, center));
+                    pairs.push((center + bin_spacing, center));
                 } else {
-                    pairs.push((center, center + 1));
+                    pairs.push((center, center + bin_spacing));
                 }
             }
             counter += 1;
@@ -144,15 +146,15 @@ mod tests {
     #[test]
     fn bin_pairs_deterministic() {
         let key = WatermarkKey::new(&[42u8; 16]).unwrap();
-        let pairs1 = key.generate_bin_pairs(0, 30, 5, 500);
-        let pairs2 = key.generate_bin_pairs(0, 30, 5, 500);
+        let pairs1 = key.generate_bin_pairs(0, 30, 5, 500, 1);
+        let pairs2 = key.generate_bin_pairs(0, 30, 5, 500, 1);
         assert_eq!(pairs1, pairs2);
     }
 
     #[test]
     fn bin_pairs_in_range() {
         let key = WatermarkKey::new(&[1u8; 16]).unwrap();
-        let pairs = key.generate_bin_pairs(7, 30, 5, 500);
+        let pairs = key.generate_bin_pairs(7, 30, 5, 500, 1);
         assert_eq!(pairs.len(), 30);
         for (a, b) in &pairs {
             assert!(*a >= 5 && *a < 500);
@@ -164,10 +166,24 @@ mod tests {
     }
 
     #[test]
+    fn bin_pairs_with_spacing() {
+        let key = WatermarkKey::new(&[1u8; 16]).unwrap();
+        let pairs = key.generate_bin_pairs(7, 30, 5, 500, 4);
+        assert_eq!(pairs.len(), 30);
+        for (a, b) in &pairs {
+            assert!(*a >= 5 && *a < 500);
+            assert!(*b >= 5 && *b < 500);
+            assert_ne!(a, b);
+            // Bin spacing of 4: difference should be exactly 4
+            assert_eq!((*a as isize - *b as isize).unsigned_abs(), 4);
+        }
+    }
+
+    #[test]
     fn bin_pairs_differ_across_frames() {
         let key = WatermarkKey::new(&[99u8; 16]).unwrap();
-        let p0 = key.generate_bin_pairs(0, 30, 5, 500);
-        let p1 = key.generate_bin_pairs(1, 30, 5, 500);
+        let p0 = key.generate_bin_pairs(0, 30, 5, 500, 1);
+        let p1 = key.generate_bin_pairs(1, 30, 5, 500, 1);
         assert_ne!(p0, p1);
     }
 }

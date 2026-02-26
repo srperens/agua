@@ -4,6 +4,7 @@ use gstreamer_base as gst_base;
 
 use gst::glib;
 use gst::glib::prelude::*;
+use gst::prelude::{ElementExtManual, PadExtManual};
 use gst_audio::subclass::prelude::*;
 
 use agua_core::{Payload, StreamEmbedder, WatermarkConfig, WatermarkKey};
@@ -26,6 +27,7 @@ mod imp {
         num_bin_pairs: usize,
         min_freq_hz: f32,
         max_freq_hz: f32,
+        bin_spacing: usize,
         offset_seconds: f32,
         sample_rate: u32,
         channels: u32,
@@ -45,6 +47,7 @@ mod imp {
                 num_bin_pairs: 60,
                 min_freq_hz: 860.0,
                 max_freq_hz: 4300.0,
+                bin_spacing: 4,
                 offset_seconds: 0.0,
                 sample_rate: 48000,
                 channels: 1,
@@ -152,6 +155,13 @@ mod imp {
                         .maximum(20000.0)
                         .default_value(4300.0)
                         .build(),
+                    glib::ParamSpecUInt::builder("bin-spacing")
+                        .nick("Bin spacing")
+                        .blurb("Spacing between bins in each pair (1 = adjacent)")
+                        .minimum(1)
+                        .maximum(100)
+                        .default_value(4)
+                        .build(),
                     glib::ParamSpecFloat::builder("offset-seconds")
                         .nick("Offset seconds")
                         .blurb("Delay before embedding starts (seconds)")
@@ -195,6 +205,9 @@ mod imp {
                 "max-freq" => {
                     settings.max_freq_hz = value.get::<f32>().unwrap_or(4300.0);
                 }
+                "bin-spacing" => {
+                    settings.bin_spacing = value.get::<u32>().unwrap_or(1).max(1) as usize;
+                }
                 "offset-seconds" => {
                     settings.offset_seconds = value.get::<f32>().unwrap_or(0.0);
                 }
@@ -212,6 +225,7 @@ mod imp {
                 "num-bin-pairs" => (settings.num_bin_pairs as u32).to_value(),
                 "min-freq" => settings.min_freq_hz.to_value(),
                 "max-freq" => settings.max_freq_hz.to_value(),
+                "bin-spacing" => (settings.bin_spacing as u32).to_value(),
                 "offset-seconds" => settings.offset_seconds.to_value(),
                 _ => unimplemented!(),
             }
@@ -262,6 +276,11 @@ mod imp {
 
         fn sink_event(&self, event: gst::Event) -> bool {
             if let gst::EventView::Eos(_) = event.view() {
+                let settings = self.settings.lock().unwrap();
+                let sample_rate = settings.sample_rate;
+                let num_channels = settings.channels as usize;
+                drop(settings);
+
                 let mut state = self.buffer_state.lock().unwrap();
                 if state.initialized && !state.embedders.is_empty() {
                     let channels = state.embedders.len();
@@ -284,6 +303,25 @@ mod imp {
                             }
                         }
                     }
+
+                    // Push any remaining processed data as a final buffer.
+                    // generate_output won't be called after EOS, so we enqueue
+                    // it now so generate_output can drain it.
+                    let remaining = state.processed.len();
+                    if remaining > 0 {
+                        let ch = num_channels.max(1);
+                        let frames = remaining / ch;
+                        let ns = (frames as u64).saturating_mul(gst::ClockTime::SECOND.nseconds())
+                            / sample_rate as u64;
+                        state.pending.push_back(PendingBuf {
+                            size_samples: remaining,
+                            pts: None,
+                            duration: Some(gst::ClockTime::from_nseconds(ns)),
+                            flags: gst::BufferFlags::empty(),
+                            offset: None,
+                            offset_end: None,
+                        });
+                    }
                 }
             }
             self.parent_sink_event(event)
@@ -297,6 +335,31 @@ mod imp {
             state.initialized = false;
             state.offset_remaining_frames = 0;
             Ok(())
+        }
+
+        fn query(&self, direction: gst::PadDirection, query: &mut gst::QueryRef) -> bool {
+            if let gst::QueryViewMut::Latency(ref mut q) = query.view_mut() {
+                let mut peer_query = gst::query::Latency::new();
+                let upstream_ok = self
+                    .obj()
+                    .sink_pads()
+                    .first()
+                    .map(|p: &gst::Pad| p.peer_query(&mut peer_query))
+                    .unwrap_or(false);
+                if upstream_ok {
+                    let (live, min, max) = peer_query.result();
+                    let settings = self.settings.lock().unwrap();
+                    let our_latency = gst::ClockTime::from_nseconds(
+                        (settings.frame_size as u64)
+                            .saturating_mul(gst::ClockTime::SECOND.nseconds())
+                            / settings.sample_rate as u64,
+                    );
+                    q.set(live, min + our_latency, max.map(|m| m + our_latency));
+                    return true;
+                }
+                return false;
+            }
+            BaseTransformImplExt::parent_query(self, direction, query)
         }
 
         fn submit_input_buffer(
@@ -369,6 +432,7 @@ mod imp {
                     num_bin_pairs: settings.num_bin_pairs,
                     min_freq_hz: settings.min_freq_hz,
                     max_freq_hz: settings.max_freq_hz,
+                    bin_spacing: settings.bin_spacing,
                 };
                 let channels = settings.channels as usize;
                 let mut embedders = Vec::with_capacity(channels);
@@ -391,8 +455,6 @@ mod imp {
                 state.embedders = embedders;
                 state.initialized = true;
             }
-
-            let processed_before = state.processed.len();
 
             let frames_in_buf = sample_count / channels;
             let mut embed_start_frame = 0usize;
@@ -441,26 +503,16 @@ mod imp {
                 }
             }
 
-            let produced_samples = state.processed.len() - processed_before;
-            if produced_samples > 0 {
-                let frames_out = produced_samples / channels;
-                let duration = if frames_out > 0 {
-                    let ns = (frames_out as u64).saturating_mul(gst::ClockTime::SECOND.nseconds())
-                        / settings.sample_rate as u64;
-                    Some(gst::ClockTime::from_nseconds(ns))
-                } else {
-                    None
-                };
-                let pts = inbuf.pts();
-                state.pending.push_back(PendingBuf {
-                    size_samples: produced_samples,
-                    pts,
-                    duration,
-                    flags: inbuf.flags(),
-                    offset: Some(inbuf.offset()),
-                    offset_end: Some(inbuf.offset_end()),
-                });
-            }
+            // Always create PendingBuf matching input buffer size so downstream
+            // sees the same buffer rhythm as upstream (even flow).
+            state.pending.push_back(PendingBuf {
+                size_samples: sample_count,
+                pts: inbuf.pts(),
+                duration: inbuf.duration(),
+                flags: inbuf.flags(),
+                offset: Some(inbuf.offset()),
+                offset_end: Some(inbuf.offset_end()),
+            });
 
             gst::debug!(
                 gst::CAT_DEFAULT,

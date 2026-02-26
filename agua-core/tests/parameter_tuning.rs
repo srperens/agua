@@ -154,6 +154,12 @@ const CODECS: &[CodecSpec] = &[
 
 const STRENGTHS: &[f32] = &[0.01, 0.02, 0.03, 0.05, 0.08];
 
+/// Strength values for the digital-only sweep (no codec).
+const DIGITAL_STRENGTHS: &[f32] = &[
+    0.001, 0.002, 0.003, 0.005, 0.008, 0.01, 0.015, 0.02, 0.03, 0.05, 0.08, 0.10, 0.15, 0.20,
+    0.25,
+];
+
 #[test]
 #[ignore]
 fn parameter_sweep() {
@@ -212,5 +218,155 @@ fn parameter_sweep() {
             }
         }
         println!();
+    }
+}
+
+/// Pure digital strength sweep — no codec, no degradation.
+///
+/// Tests embed → detect at many strength levels to find the minimum viable
+/// strength and verify that confidence scales as expected.
+///
+/// Run with: `cargo test digital_strength_sweep -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn digital_strength_sweep() {
+    let key = WatermarkKey::new(&[42u8; 16]).unwrap();
+    let payload = Payload::new([
+        0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC,
+        0xBA, 0x98,
+    ]);
+
+    let sample_rate = 48000u32;
+    let num_samples = sample_rate as usize * 25; // 25 seconds
+
+    println!();
+    println!(
+        "{:<10} {:<10} {:<10} {:<10} {:<10} {:<8}",
+        "Strength", "Detected", "Correct", "Confid.", "SyncCorr", "SNR(dB)"
+    );
+    println!("{}", "-".repeat(58));
+
+    for &strength in DIGITAL_STRENGTHS {
+        let config = WatermarkConfig {
+            strength,
+            ..WatermarkConfig::default()
+        };
+
+        // Generate fresh audio for each strength to avoid cumulative artifacts
+        let original = make_test_audio(num_samples, sample_rate);
+        let mut audio = original.clone();
+        agua_core::embed(&mut audio, &payload, &key, &config).unwrap();
+
+        // Compute embedding SNR: how much did we change the signal?
+        let mut signal_power = 0.0f64;
+        let mut noise_power = 0.0f64;
+        for (o, w) in original.iter().zip(audio.iter()) {
+            signal_power += (*o as f64) * (*o as f64);
+            noise_power += ((*w - *o) as f64) * ((*w - *o) as f64);
+        }
+        let snr_db = if noise_power > 0.0 {
+            10.0 * (signal_power / noise_power).log10()
+        } else {
+            f64::INFINITY
+        };
+
+        // Detect
+        let (result, diag) = agua_core::detect_with_diagnostics(&audio, &key, &config);
+        let (detected, correct, confidence, sync_corr) = match result {
+            Ok(ref results) if !results.is_empty() => {
+                let r = &results[0];
+                (true, r.payload == payload, r.confidence, diag.best_sync_corr)
+            }
+            Ok(_) => (false, false, 0.0, diag.best_sync_corr),
+            Err(_) => (false, false, 0.0, diag.best_sync_corr),
+        };
+
+        println!(
+            "{:<10.4} {:<10} {:<10} {:<10.4} {:<10.4} {:<8.1}",
+            strength,
+            if detected { "YES" } else { "no" },
+            if correct {
+                "YES"
+            } else if detected {
+                "WRONG"
+            } else {
+                "-"
+            },
+            confidence,
+            sync_corr,
+            snr_db,
+        );
+    }
+}
+
+/// Same sweep but through the StreamDetector (streaming path, as WASM uses).
+///
+/// Feeds audio in small chunks (128 samples) to verify that streaming detection
+/// matches batch detection.
+///
+/// Run with: `cargo test streaming_strength_sweep -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn streaming_strength_sweep() {
+    use agua_core::StreamDetector;
+
+    let key = WatermarkKey::new(&[42u8; 16]).unwrap();
+    let payload = Payload::new([
+        0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC,
+        0xBA, 0x98,
+    ]);
+
+    let sample_rate = 48000u32;
+    let num_samples = sample_rate as usize * 25;
+
+    println!();
+    println!(
+        "{:<10} {:<10} {:<10} {:<10} {:<10}",
+        "Strength", "Detected", "Correct", "Confid.", "Chunks"
+    );
+    println!("{}", "-".repeat(50));
+
+    for &strength in DIGITAL_STRENGTHS {
+        let config = WatermarkConfig {
+            strength,
+            ..WatermarkConfig::default()
+        };
+
+        let mut audio = make_test_audio(num_samples, sample_rate);
+        agua_core::embed(&mut audio, &payload, &key, &config).unwrap();
+
+        let mut detector = StreamDetector::new(&key, &config).unwrap();
+        let mut results = Vec::new();
+        let mut chunk_count = 0u32;
+
+        for chunk in audio.chunks(128) {
+            let r = detector.process(chunk);
+            chunk_count += 1;
+            results.extend(r);
+        }
+        if let Some(r) = detector.finalize() {
+            results.push(r);
+        }
+
+        let (detected, correct, confidence) = if let Some(r) = results.first() {
+            (true, r.payload == payload, r.confidence)
+        } else {
+            (false, false, 0.0)
+        };
+
+        println!(
+            "{:<10.4} {:<10} {:<10} {:<10.4} {:<10}",
+            strength,
+            if detected { "YES" } else { "no" },
+            if correct {
+                "YES"
+            } else if detected {
+                "WRONG"
+            } else {
+                "-"
+            },
+            confidence,
+            chunk_count,
+        );
     }
 }

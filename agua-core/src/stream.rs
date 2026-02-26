@@ -177,6 +177,12 @@ pub struct StreamDetector {
     block_samples: usize,
     /// Total samples consumed (for offset reporting).
     total_samples_consumed: usize,
+    /// Diagnostics: number of detection attempts so far.
+    diag_detect_attempts: u32,
+    /// Diagnostics: best sync correlation seen in last detection attempt.
+    diag_best_sync_corr: f32,
+    /// Diagnostics: number of sync candidates above threshold in last attempt.
+    diag_sync_candidates: u32,
 }
 
 impl StreamDetector {
@@ -199,6 +205,9 @@ impl StreamDetector {
             max_buf_samples,
             block_samples,
             total_samples_consumed: 0,
+            diag_detect_attempts: 0,
+            diag_best_sync_corr: 0.0,
+            diag_sync_candidates: 0,
         })
     }
 
@@ -213,8 +222,14 @@ impl StreamDetector {
             if let Some(result) = self.try_detect_batch() {
                 results.push(result);
             } else {
-                // No detection — advance past half a block to avoid re-scanning
-                let advance = self.block_samples / 2;
+                // No detection — advance by the scan window size so the
+                // next attempt covers new frame positions. The scan window
+                // is (num_frames - frames_per_block) frames.
+                let hop_size = self.config.hop_size();
+                let num_frames =
+                    (self.audio_buf.len() - self.config.frame_size) / hop_size + 1;
+                let scanned_frames = num_frames.saturating_sub(self.frames_per_block);
+                let advance = (scanned_frames * hop_size).max(hop_size);
                 let drain = advance.min(self.audio_buf.len());
                 self.audio_buf.drain(..drain);
                 self.total_samples_consumed += drain;
@@ -236,8 +251,22 @@ impl StreamDetector {
     /// handles both sync search and sub-frame alignment internally.
     fn try_detect_batch(&mut self) -> Option<DetectionResult> {
         let hop_size = self.config.hop_size();
+        self.diag_detect_attempts += 1;
 
-        if let Ok(det_results) = crate::detect::detect(&self.audio_buf, &self.key, &self.config)
+        // Use single-offset detection (offset 0) for speed. The streaming
+        // drain mechanism provides offset diversity over time, so we don't
+        // need the expensive multi-offset search that detect() does.
+        // This avoids 16× FFT passes and hundreds of Viterbi decodes that
+        // would freeze WASM for minutes.
+        let (result, diag) = crate::detect::detect_single_offset_with_diagnostics(
+            &self.audio_buf,
+            &self.key,
+            &self.config,
+        );
+        self.diag_best_sync_corr = diag.best_sync_corr;
+        self.diag_sync_candidates = diag.sync_candidates;
+
+        if let Ok(det_results) = result
             && let Some(result) = det_results.into_iter().next()
         {
             // Drain buffer past the detected block
@@ -273,10 +302,33 @@ impl StreamDetector {
         (self.audio_buf.len() as f32 / self.block_samples as f32).min(1.0)
     }
 
+    /// Number of detection attempts so far.
+    pub fn diag_detect_attempts(&self) -> u32 {
+        self.diag_detect_attempts
+    }
+
+    /// Best sync correlation found in the last detection attempt.
+    pub fn diag_best_sync_corr(&self) -> f32 {
+        self.diag_best_sync_corr
+    }
+
+    /// Number of sync candidates above threshold in the last detection attempt.
+    pub fn diag_sync_candidates(&self) -> u32 {
+        self.diag_sync_candidates
+    }
+
+    /// Number of samples currently buffered.
+    pub fn diag_buffer_samples(&self) -> usize {
+        self.audio_buf.len()
+    }
+
     /// Reset the detector state, clearing all buffered data.
     pub fn reset(&mut self) {
         self.audio_buf.clear();
         self.total_samples_consumed = 0;
+        self.diag_detect_attempts = 0;
+        self.diag_best_sync_corr = 0.0;
+        self.diag_sync_candidates = 0;
     }
 }
 

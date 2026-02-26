@@ -49,10 +49,11 @@ dependencies = [
 
 [[package]]
 name = "agua-web"
-version = "0.2.0"
+version = "0.5.0"
 dependencies = [
  "agua-core",
  "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]
