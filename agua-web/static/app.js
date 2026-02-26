@@ -1,6 +1,6 @@
 
 
-const VERSION = "0.5.0";
+const VERSION = "0.5.1";
 const PROCESS_INTERVAL_MS = 50;
 const MAX_SAMPLES_PER_TICK = 48000; // ~1s at 48kHz — allows catching up if backlog grows
 const MAX_QUEUE_SAMPLES = 48000 * 5; // cap backlog to ~5s to avoid UI slowdown
