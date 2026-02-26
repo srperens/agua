@@ -20,9 +20,9 @@ impl Default for WatermarkConfig {
     fn default() -> Self {
         Self {
             sample_rate: 48000,
-            strength: 0.02,
+            strength: 0.1,
             frame_size: 1024,
-            num_bin_pairs: 30,
+            num_bin_pairs: 60,
             min_freq_hz: 860.0,
             max_freq_hz: 4300.0,
         }

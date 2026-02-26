@@ -176,7 +176,7 @@
   </style>
 </head>
 <body>
-  <h1>agua watermark detector <span style="font-size:0.5em;font-weight:400;color:var(--text-dim)">v0.1.5</span></h1>
+  <h1>agua watermark detector <span style="font-size:0.5em;font-weight:400;color:var(--text-dim)">v0.3.2</span></h1>
 
   <div class="card">
     <div class="label">Input device</div>
@@ -185,10 +185,14 @@
         <option value="">Default</option>
       </select>
     </div>
+    <div class="stats" style="margin-top:0.35rem;color:#c0392b;">
+      Browser/OS may still apply DSP (AGC/NS/AEC), especially on iOS.
+    </div>
+    <div id="constraints-info" class="stats" style="margin-top:0.35rem;display:none;"></div>
 
     <div class="label">Key passphrase</div>
     <div class="key-row">
-      <input type="text" id="key-input" placeholder="agua-demo" value="agua-demo">
+      <input type="text" id="key-input" placeholder="agua-default-key" value="agua-default-key">
     </div>
 
     <div class="controls">
@@ -225,6 +229,55 @@
     <div class="stats">
       <div>Sample rate: <span id="sample-rate">&mdash;</span></div>
     </div>
+
+    <div class="label" style="margin-top: 0.75rem;">Debug</div>
+    <div class="stats" style="margin-bottom: 0.25rem;">
+      <label style="display:flex;gap:0.5rem;align-items:center;">
+        <input type="checkbox" id="debug-toggle">
+        <span>Show debug stats</span>
+      </label>
+    </div>
+    <div class="label" style="margin-top: 0.5rem;">Input gain</div>
+    <div class="stats" style="margin-bottom: 0.25rem;">
+      <input type="range" id="gain-slider" min="0.25" max="8" step="0.25" value="1" style="width:100%;">
+      <span id="gain-value" style="min-width:3rem;text-align:right;">1.00x</span>
+    </div>
+    <div class="stats" style="margin-bottom: 0.25rem;">
+      <label style="display:flex;gap:0.5rem;align-items:center;">
+        <input type="checkbox" id="auto-gain-toggle">
+        <span>Auto gain (target RMS)</span>
+      </label>
+      <span id="auto-gain-value" style="min-width:3rem;text-align:right;">0.05</span>
+    </div>
+    <div id="signal-warning" class="stats" style="display:none;color:#c0392b;">
+      Signal too low for detection
+    </div>
+    <div class="label" style="margin-top: 0.5rem;">VU meter</div>
+    <div class="progress-container">
+      <div id="vu-bar" class="progress-bar confidence"></div>
+    </div>
+    <div id="debug-panel" class="stats" style="display:none;flex-direction:column;gap:0.25rem;">
+      <div>RMS pre-gain: <span id="dbg-rms-pre">&mdash;</span> Peak pre-gain: <span id="dbg-peak-pre">&mdash;</span></div>
+      <div>RMS post-gain: <span id="dbg-rms">&mdash;</span> Peak post-gain: <span id="dbg-peak">&mdash;</span></div>
+      <div>Band energy pre-gain: <span id="dbg-band">&mdash;</span></div>
+      <div>Band energy post-gain: <span id="dbg-band-post">&mdash;</span></div>
+      <div>Queued samples: <span id="dbg-queued">&mdash;</span></div>
+      <div>Processed samples: <span id="dbg-processed">&mdash;</span></div>
+      <div>Last process batch: <span id="dbg-batch">&mdash;</span></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="label">Offline test</div>
+    <div class="stats" style="margin-bottom:0.5rem;">
+      Load a watermarked WAV file and run detection locally (no mic).
+    </div>
+    <div class="key-row">
+      <input type="file" id="offline-file" accept=".wav,audio/wav">
+      <button id="offline-run" disabled>Run detect</button>
+      <button id="offline-demo">Load demo WAV</button>
+    </div>
+    <div class="stats" id="offline-status">&mdash;</div>
   </div>
 
   <div class="card">
@@ -232,6 +285,6 @@
     <div id="detection-log" class="log-section"></div>
   </div>
 
-  <script type="module" src="app.js?v=0.1.2"></script>
+  <script type="module" src="app.js?v=0.3.2"></script>
 </body>
 </html>

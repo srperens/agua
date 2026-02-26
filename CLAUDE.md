@@ -14,14 +14,14 @@ Patchwork-based audio watermarking in the FFT domain. Embeds a 128-bit payload i
 
 Key parameters (v0.2):
 - **Frequency range:** 860-4300 Hz (bin range computed dynamically from sample_rate)
-- **Bin pairs/frame:** 30
+- **Bin pairs/frame:** 60
 - **Encoding:** Power-law: `mag^(1+/-delta)` (NOT linear)
 - **FFT window:** Hann + overlap-add with 50% hop (frame_size=1024, hop_size=512)
 - **FEC:** Convolutional code K=15, rate 1/6 (16384 Viterbi states)
 - **Sync pattern:** 128 bits (two AES blocks)
 - **Block structure:** 128 sync frames + 960 data frames = 1088 frames/block
 - **Payload:** 128 bits + CRC-32, convolutionally encoded to 960 coded bits
-- **Default strength:** 0.02
+- **Default strength:** 0.1
 
 There is no legacy/profile system. v0.1 is not deployed anywhere.
 

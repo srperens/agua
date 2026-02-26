@@ -29,7 +29,7 @@ enum Command {
         key: String,
 
         /// Embedding strength (power-law exponent delta)
-        #[arg(short, long, default_value = "0.02")]
+        #[arg(short, long, default_value = "0.1")]
         strength: f32,
 
         /// Delay before embedding starts (seconds)
@@ -41,7 +41,7 @@ enum Command {
         frame_size: usize,
 
         /// Number of bin pairs per frame
-        #[arg(long, default_value = "30")]
+        #[arg(long, default_value = "60")]
         num_bin_pairs: usize,
 
         /// Minimum frequency in Hz for watermark embedding
@@ -71,7 +71,7 @@ enum Command {
         frame_size: usize,
 
         /// Number of bin pairs per frame
-        #[arg(long, default_value = "30")]
+        #[arg(long, default_value = "60")]
         num_bin_pairs: usize,
 
         /// Minimum frequency in Hz for watermark embedding
@@ -81,6 +81,10 @@ enum Command {
         /// Maximum frequency in Hz for watermark embedding
         #[arg(long, default_value = "4300.0")]
         max_freq: f32,
+
+        /// Show debug diagnostics (sync correlations, soft values) on failure
+        #[arg(short, long)]
+        verbose: bool,
     },
 }
 
@@ -219,6 +223,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             num_bin_pairs,
             min_freq,
             max_freq,
+            verbose,
         } => {
             if !frame_size.is_power_of_two() {
                 return Err(format!("frame_size must be power of 2, got {frame_size}").into());
@@ -252,7 +257,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let wm_key = agua_core::WatermarkKey::from_passphrase(&key);
             let config = agua_core::WatermarkConfig {
                 sample_rate: spec.sample_rate,
-                strength: 0.02,
+                strength: 0.1,
                 frame_size,
                 num_bin_pairs,
                 min_freq_hz: min_freq,
@@ -311,6 +316,73 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(agua_core::Error::NotDetected) => {
+                    if verbose {
+                        // Debug: compute best sync correlations to see if any peaks exist
+                        use agua_core::{fft::FftProcessor, frame::hann_window, sync};
+                        let hop_size = config.hop_size();
+                        let frame_size = config.frame_size;
+                        if samples[start..].len() >= frame_size {
+                            let num_frames = (samples[start..].len() - frame_size) / hop_size + 1;
+                            let window = hann_window(frame_size);
+                            let mut fft = FftProcessor::new(frame_size)?;
+                            let mut soft_values = Vec::with_capacity(num_frames);
+                            for frame_idx in 0..num_frames {
+                                let offset = frame_idx * hop_size;
+                                let mut buf = vec![0.0f32; frame_size];
+                                let end = (offset + frame_size).min(samples[start..].len());
+                                buf[..end - offset].copy_from_slice(&samples[start..][offset..end]);
+                                for (i, s) in buf.iter_mut().enumerate() {
+                                    *s *= window[i];
+                                }
+                                fft.forward(&mut buf)?;
+                                let global_frame = frame_offset as usize + frame_idx;
+                                let soft = agua_core::patchwork::detect_frame(
+                                    fft.freq_bins(),
+                                    &wm_key,
+                                    global_frame as u32,
+                                    &config,
+                                );
+                                soft_values.push(soft);
+                            }
+
+                            let sync_pattern = sync::generate_sync_pattern(&wm_key);
+                            let frames_per_block = sync::frames_per_block();
+                            let scan_end = num_frames.saturating_sub(frames_per_block);
+                            let mut best: Vec<(usize, f32)> = (0..=scan_end)
+                                .map(|start| {
+                                    let sync_soft =
+                                        &soft_values[start..start + sync::SYNC_PATTERN_BITS];
+                                    let corr = sync::correlate_sync(sync_soft, &sync_pattern);
+                                    (start, corr)
+                                })
+                                .collect();
+                            best.sort_by(|a, b| {
+                                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            let top = best.iter().take(5).cloned().collect::<Vec<_>>();
+                            let max = soft_values
+                                .iter()
+                                .cloned()
+                                .fold(f32::NEG_INFINITY, f32::max);
+                            let min = soft_values.iter().cloned().fold(f32::INFINITY, f32::min);
+                            let mean = if soft_values.is_empty() {
+                                0.0
+                            } else {
+                                soft_values.iter().sum::<f32>() / soft_values.len() as f32
+                            };
+                            eprintln!(
+                                "Debug: soft_values count={}, min={:.5}, max={:.5}, mean={:.5}",
+                                soft_values.len(),
+                                min,
+                                max,
+                                mean
+                            );
+                            eprintln!("Debug: top sync correlations (start_frame, corr):");
+                            for (i, (s, c)) in top.iter().enumerate() {
+                                eprintln!("  {}: start={} corr={:.5}", i + 1, s, c);
+                            }
+                        }
+                    }
                     eprintln!("No watermark detected.");
                     std::process::exit(1);
                 }

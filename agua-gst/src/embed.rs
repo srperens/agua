@@ -6,7 +6,7 @@ use gst::glib;
 use gst::glib::prelude::*;
 use gst_audio::subclass::prelude::*;
 
-use agua_core::{Payload, WatermarkConfig, WatermarkKey};
+use agua_core::{Payload, StreamEmbedder, WatermarkConfig, WatermarkKey};
 
 mod imp {
     use super::*;
@@ -29,7 +29,6 @@ mod imp {
         offset_seconds: f32,
         sample_rate: u32,
         channels: u32,
-        offset_frames: u64,
     }
 
     impl Default for Settings {
@@ -41,15 +40,14 @@ mod imp {
                 payload: None,
                 key_passphrase,
                 key,
-                strength: 0.02,
+                strength: 0.1,
                 frame_size: 1024,
-                num_bin_pairs: 30,
+                num_bin_pairs: 60,
                 min_freq_hz: 860.0,
                 max_freq_hz: 4300.0,
                 offset_seconds: 0.0,
                 sample_rate: 48000,
                 channels: 1,
-                offset_frames: 0,
             }
         }
     }
@@ -68,12 +66,25 @@ mod imp {
         }
     }
 
-    #[derive(Default)]
     struct BufferState {
-        adapter: VecDeque<f32>,
+        /// One StreamEmbedder per audio channel, created on first buffer.
+        embedders: Vec<StreamEmbedder>,
         processed: VecDeque<f32>,
         pending: VecDeque<PendingBuf>,
-        frame_index: u64,
+        initialized: bool,
+        offset_remaining_frames: usize,
+    }
+
+    impl Default for BufferState {
+        fn default() -> Self {
+            Self {
+                embedders: Vec::new(),
+                processed: VecDeque::new(),
+                pending: VecDeque::new(),
+                initialized: false,
+                offset_remaining_frames: 0,
+            }
+        }
     }
 
     #[derive(Clone, Debug)]
@@ -111,7 +122,7 @@ mod imp {
                         .blurb("Embedding strength (power-law exponent delta)")
                         .minimum(0.0)
                         .maximum(10.0)
-                        .default_value(0.02)
+                        .default_value(0.1)
                         .build(),
                     glib::ParamSpecUInt::builder("frame-size")
                         .nick("Frame size")
@@ -125,7 +136,7 @@ mod imp {
                         .blurb("Number of bin pairs per frame")
                         .minimum(1)
                         .maximum(2000)
-                        .default_value(30)
+                        .default_value(60)
                         .build(),
                     glib::ParamSpecFloat::builder("min-freq")
                         .nick("Min frequency")
@@ -170,13 +181,13 @@ mod imp {
                     settings.key_passphrase = key_passphrase;
                 }
                 "strength" => {
-                    settings.strength = value.get::<f32>().unwrap_or(0.02);
+                    settings.strength = value.get::<f32>().unwrap_or(0.1);
                 }
                 "frame-size" => {
                     settings.frame_size = value.get::<u32>().unwrap_or(1024) as usize;
                 }
                 "num-bin-pairs" => {
-                    settings.num_bin_pairs = value.get::<u32>().unwrap_or(30) as usize;
+                    settings.num_bin_pairs = value.get::<u32>().unwrap_or(60) as usize;
                 }
                 "min-freq" => {
                     settings.min_freq_hz = value.get::<f32>().unwrap_or(860.0);
@@ -186,7 +197,6 @@ mod imp {
                 }
                 "offset-seconds" => {
                     settings.offset_seconds = value.get::<f32>().unwrap_or(0.0);
-                    settings.offset_frames = 0;
                 }
                 _ => unimplemented!(),
             }
@@ -240,7 +250,6 @@ mod imp {
             let mut settings = self.settings.lock().unwrap();
             settings.sample_rate = info.rate();
             settings.channels = info.channels();
-            settings.offset_frames = 0;
             Ok(())
         }
     }
@@ -251,12 +260,42 @@ mod imp {
         const PASSTHROUGH_ON_SAME_CAPS: bool = false;
         const TRANSFORM_IP_ON_PASSTHROUGH: bool = false;
 
+        fn sink_event(&self, event: gst::Event) -> bool {
+            if let gst::EventView::Eos(_) = event.view() {
+                let mut state = self.buffer_state.lock().unwrap();
+                if state.initialized && !state.embedders.is_empty() {
+                    let channels = state.embedders.len();
+                    let mut channel_outputs: Vec<Vec<f32>> = Vec::with_capacity(channels);
+                    for ch in 0..channels {
+                        channel_outputs.push(state.embedders[ch].flush());
+                    }
+                    let out_frames = channel_outputs.iter().map(|v| v.len()).min().unwrap_or(0);
+                    if out_frames > 0 {
+                        if channel_outputs.iter().any(|v| v.len() != out_frames) {
+                            gst::warning!(
+                                gst::CAT_DEFAULT,
+                                obj = self.obj(),
+                                "Channel flush length mismatch; truncating to {out_frames} frames"
+                            );
+                        }
+                        for i in 0..out_frames {
+                            for ch in 0..channels {
+                                state.processed.push_back(channel_outputs[ch][i]);
+                            }
+                        }
+                    }
+                }
+            }
+            self.parent_sink_event(event)
+        }
+
         fn start(&self) -> Result<(), gst::ErrorMessage> {
             let mut state = self.buffer_state.lock().unwrap();
-            state.adapter.clear();
+            state.embedders.clear();
             state.processed.clear();
             state.pending.clear();
-            state.frame_index = 0;
+            state.initialized = false;
+            state.offset_remaining_frames = 0;
             Ok(())
         }
 
@@ -265,7 +304,7 @@ mod imp {
             is_discont: bool,
             inbuf: gst::Buffer,
         ) -> Result<gst::FlowSuccess, gst::FlowError> {
-            let mut settings = self.settings.lock().unwrap();
+            let settings = self.settings.lock().unwrap();
             let payload = match &settings.payload {
                 Some(p) => p.clone(),
                 None => {
@@ -285,12 +324,6 @@ mod imp {
                     "frame-size must be a power of two"
                 );
                 return Err(gst::FlowError::Error);
-            }
-
-            if settings.offset_frames == 0 && settings.offset_seconds > 0.0 {
-                let offset_samples =
-                    (settings.offset_seconds * settings.sample_rate as f32).round() as usize;
-                settings.offset_frames = (offset_samples / settings.frame_size) as u64;
             }
 
             let map = inbuf.map_readable().map_err(|_| gst::FlowError::Error)?;
@@ -321,68 +354,123 @@ mod imp {
 
             let mut state = self.buffer_state.lock().unwrap();
             if is_discont {
-                state.adapter.clear();
+                state.embedders.clear();
                 state.processed.clear();
                 state.pending.clear();
-                state.frame_index = 0;
+                state.initialized = false;
+                state.offset_remaining_frames = 0;
             }
 
-            state.pending.push_back(PendingBuf {
-                size_samples: sample_count,
-                pts: inbuf.pts(),
-                duration: inbuf.duration(),
-                flags: inbuf.flags(),
-                offset: Some(inbuf.offset()),
-                offset_end: Some(inbuf.offset_end()),
-            });
+            if !state.initialized {
+                let config = WatermarkConfig {
+                    sample_rate: settings.sample_rate,
+                    strength: settings.strength,
+                    frame_size: settings.frame_size,
+                    num_bin_pairs: settings.num_bin_pairs,
+                    min_freq_hz: settings.min_freq_hz,
+                    max_freq_hz: settings.max_freq_hz,
+                };
+                let channels = settings.channels as usize;
+                let mut embedders = Vec::with_capacity(channels);
+                for _ in 0..channels {
+                    match StreamEmbedder::new(&payload, &settings.key, &config) {
+                        Ok(embedder) => embedders.push(embedder),
+                        Err(err) => {
+                            gst::error!(
+                                gst::CAT_DEFAULT,
+                                obj = self.obj(),
+                                "Failed to create StreamEmbedder: {err}"
+                            );
+                            return Err(gst::FlowError::Error);
+                        }
+                    }
+                }
+                let offset_frames =
+                    (settings.offset_seconds * settings.sample_rate as f32).round() as usize;
+                state.offset_remaining_frames = offset_frames;
+                state.embedders = embedders;
+                state.initialized = true;
+            }
 
-            state.adapter.extend(samples.iter().copied());
+            let processed_before = state.processed.len();
 
-            let frame_size = settings.frame_size;
-            let frame_samples = frame_size * channels;
-            let mut channel_buf = vec![0.0f32; frame_size];
+            let frames_in_buf = sample_count / channels;
+            let mut embed_start_frame = 0usize;
+            if state.offset_remaining_frames > 0 {
+                let skip_frames = state.offset_remaining_frames.min(frames_in_buf);
+                let skip_samples = skip_frames * channels;
+                state
+                    .processed
+                    .extend(samples[..skip_samples].iter().copied());
+                state.offset_remaining_frames -= skip_frames;
+                embed_start_frame = skip_frames;
+            }
 
-            while state.adapter.len() >= frame_samples {
-                let mut interleaved = vec![0.0f32; frame_samples];
-                for sample in interleaved.iter_mut().take(frame_samples) {
-                    *sample = state.adapter.pop_front().unwrap();
+            if embed_start_frame < frames_in_buf {
+                let embed_samples = &samples[embed_start_frame * channels..];
+                let embed_frames = frames_in_buf - embed_start_frame;
+                let mut channel_inputs: Vec<Vec<f32>> = (0..channels)
+                    .map(|_| Vec::with_capacity(embed_frames))
+                    .collect();
+                for frame_idx in 0..embed_frames {
+                    for ch in 0..channels {
+                        let idx = frame_idx * channels + ch;
+                        channel_inputs[ch].push(embed_samples[idx]);
+                    }
                 }
 
-                let global_frame = state.frame_index;
-
+                let mut channel_outputs: Vec<Vec<f32>> = Vec::with_capacity(channels);
                 for ch in 0..channels {
-                    for i in 0..frame_size {
-                        channel_buf[i] = interleaved[i * channels + ch];
-                    }
-
-                    if global_frame >= settings.offset_frames
-                        && let Err(err) = agua_core::embed_with_offset(
-                            &mut channel_buf,
-                            &payload,
-                            &settings.key,
-                            &WatermarkConfig {
-                                sample_rate: settings.sample_rate,
-                                strength: settings.strength,
-                                frame_size: settings.frame_size,
-                                num_bin_pairs: settings.num_bin_pairs,
-                                min_freq_hz: settings.min_freq_hz,
-                                max_freq_hz: settings.max_freq_hz,
-                            },
-                            global_frame as u32,
-                        )
-                    {
-                        gst::error!(gst::CAT_DEFAULT, obj = self.obj(), "Embed failed: {err}");
-                        return Err(gst::FlowError::Error);
-                    }
-
-                    for i in 0..frame_size {
-                        interleaved[i * channels + ch] = channel_buf[i];
-                    }
+                    channel_outputs.push(state.embedders[ch].process(&channel_inputs[ch]));
                 }
 
-                state.processed.extend(interleaved.iter().copied());
-                state.frame_index = global_frame + 1;
+                let out_frames = channel_outputs.iter().map(|v| v.len()).min().unwrap_or(0);
+                if out_frames > 0 {
+                    if channel_outputs.iter().any(|v| v.len() != out_frames) {
+                        gst::warning!(
+                            gst::CAT_DEFAULT,
+                            obj = self.obj(),
+                            "Channel output length mismatch; truncating to {out_frames} frames"
+                        );
+                    }
+                    for i in 0..out_frames {
+                        for ch in 0..channels {
+                            state.processed.push_back(channel_outputs[ch][i]);
+                        }
+                    }
+                }
             }
+
+            let produced_samples = state.processed.len() - processed_before;
+            if produced_samples > 0 {
+                let frames_out = produced_samples / channels;
+                let duration = if frames_out > 0 {
+                    let ns = (frames_out as u64).saturating_mul(gst::ClockTime::SECOND.nseconds())
+                        / settings.sample_rate as u64;
+                    Some(gst::ClockTime::from_nseconds(ns))
+                } else {
+                    None
+                };
+                let pts = inbuf.pts();
+                state.pending.push_back(PendingBuf {
+                    size_samples: produced_samples,
+                    pts,
+                    duration,
+                    flags: inbuf.flags(),
+                    offset: Some(inbuf.offset()),
+                    offset_end: Some(inbuf.offset_end()),
+                });
+            }
+
+            gst::debug!(
+                gst::CAT_DEFAULT,
+                obj = self.obj(),
+                "submit_input_buffer: in_samples={}, pending_bufs={}, processed_samples={}, offset_remaining_frames={}",
+                sample_count,
+                state.pending.len(),
+                state.processed.len(),
+                state.offset_remaining_frames
+            );
 
             Ok(gst::FlowSuccess::Ok)
         }
@@ -391,10 +479,24 @@ mod imp {
             let mut state = self.buffer_state.lock().unwrap();
             let next = match state.pending.front() {
                 Some(p) => p.clone(),
-                None => return Ok(GenerateOutputSuccess::NoOutput),
+                None => {
+                    gst::debug!(
+                        gst::CAT_DEFAULT,
+                        obj = self.obj(),
+                        "generate_output: no pending buffers"
+                    );
+                    return Ok(GenerateOutputSuccess::NoOutput);
+                }
             };
 
             if state.processed.len() < next.size_samples {
+                gst::debug!(
+                    gst::CAT_DEFAULT,
+                    obj = self.obj(),
+                    "generate_output: waiting (processed_samples={}, needed={})",
+                    state.processed.len(),
+                    next.size_samples
+                );
                 return Ok(GenerateOutputSuccess::NoOutput);
             }
 
@@ -428,6 +530,12 @@ mod imp {
             }
 
             state.pending.pop_front();
+            gst::debug!(
+                gst::CAT_DEFAULT,
+                obj = self.obj(),
+                "generate_output: produced buffer (samples={})",
+                next.size_samples
+            );
             Ok(GenerateOutputSuccess::Buffer(outbuf))
         }
     }
