@@ -1,4 +1,4 @@
-import init, { WasmDetector } from "./pkg/agua_web.js";
+import init, { WasmDetector } from "./pkg/agua_web.js?v=0.4.0";
 
 let detector = null;
 let processedTotal = 0;

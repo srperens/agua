@@ -76,7 +76,7 @@ async function runOfflineDetect(arrayBuf) {
     offlineStatus.textContent = `Decoded: ${audioBuf.length} frames @ ${audioBuf.sampleRate} Hz`;
     const channelData = audioBuf.getChannelData(0);
     const chunkSize = 4096;
-    const offlineWorker = new Worker("worker.js?v=0.3.2", { type: "module" });
+    const offlineWorker = new Worker("worker.js?v=0.4.0", { type: "module" });
     await new Promise((resolve) => {
       offlineWorker.onmessage = (event) => {
         const msg = event.data || {};
@@ -333,7 +333,7 @@ async function start() {
       constraintsInfo.style.display = "block";
     }
 
-    detectorWorker = new Worker("worker.js?v=0.3.2", { type: "module" });
+    detectorWorker = new Worker("worker.js?v=0.4.0", { type: "module" });
     detectorWorker.onmessage = (event) => {
       const msg = event.data || {};
       if (msg.type === "debug_band") {
@@ -375,7 +375,7 @@ async function start() {
     };
     detectorWorker.postMessage({ type: "init", key, sampleRate });
 
-    await audioContext.audioWorklet.addModule("processor.js");
+    await audioContext.audioWorklet.addModule("processor.js?v=0.4.0");
     const source = audioContext.createMediaStreamSource(stream);
     analyser = audioContext.createAnalyser();
     analyser.fftSize = 4096;
