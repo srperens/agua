@@ -1,23 +1,34 @@
-import init, { WasmDetector } from "./pkg/agua_web.js";
+const WORKER_VERSION = "0.6.4";
+console.log("[worker.js] loaded, VERSION=" + WORKER_VERSION);
 
+let wasmInit = null;
+let WasmDetector = null;
 let detector = null;
 let processedTotal = 0;
 let batchCount = 0;
-let sampleRate = 48000;
 
 self.onmessage = async (event) => {
   const msg = event.data || {};
   if (msg.type === "init") {
     try {
-      await init();
+      console.log("[worker] init: key='" + msg.key + "' sampleRate=" + msg.sampleRate + " preprocess=" + msg.preprocess);
+      const mod = await import("./pkg/agua_web.js?v=" + WORKER_VERSION);
+      wasmInit = mod.default;
+      WasmDetector = mod.WasmDetector;
+      await wasmInit({ module_or_path: "./pkg/agua_web_bg.wasm?v=" + WORKER_VERSION });
       detector = new WasmDetector(msg.key, msg.sampleRate);
-      sampleRate = msg.sampleRate;
+      console.log("[worker] WasmDetector created");
+      if (msg.preprocess === false) {
+        detector.set_preprocess(false);
+        console.log("[worker] preprocessing disabled");
+      }
       self.postMessage({
         type: "info",
-        message: `worker init: sampleRate=${msg.sampleRate}`,
+        message: `worker init: sampleRate=${msg.sampleRate} preprocess=${msg.preprocess}`,
       });
       self.postMessage({ type: "ready" });
     } catch (err) {
+      console.error("[worker] init FAILED:", err);
       self.postMessage({ type: "info", message: `worker init FAILED: ${err}` });
     }
     return;
@@ -26,21 +37,24 @@ self.onmessage = async (event) => {
     const samples = msg.samples;
     processedTotal += samples.length;
     batchCount += 1;
+    if (batchCount === 1) {
+      console.log("[worker] first chunk: length=" + samples.length + " first5=[" + Array.from(samples.slice(0, 5)).map(v => v.toFixed(6)) + "]");
+    }
     const payload = detector.process(samples);
     const confidence = detector.get_confidence();
     const bufferFill = detector.get_buffer_fill();
+    const bestSyncCorr = typeof detector.get_best_sync_corr === "function" ? detector.get_best_sync_corr() : 0;
+    const detectAttempts = typeof detector.get_detect_attempts === "function" ? detector.get_detect_attempts() : 0;
+    const syncCandidates = typeof detector.get_sync_candidates === "function" ? detector.get_sync_candidates() : 0;
+
     if (batchCount % 50 === 0) {
-      self.postMessage({
-        type: "info",
-        message: `worker process: batches=${batchCount} totalSamples=${processedTotal} bufferFill=${bufferFill.toFixed(
-          3,
-        )}`,
-      });
+      console.log("[worker] batch=" + batchCount + " total=" + processedTotal + " fill=" + bufferFill.toFixed(3) + " syncCorr=" + bestSyncCorr.toFixed(4) + " candidates=" + syncCandidates + " attempts=" + detectAttempts);
     }
     if (payload) {
+      console.log("[worker] DETECTED: payload=" + payload + " confidence=" + confidence.toFixed(4));
       self.postMessage({
         type: "info",
-        message: `worker detect: payload=${payload} confidence=${confidence.toFixed(4)}`,
+        message: `DETECTED: payload=${payload} confidence=${confidence.toFixed(4)}`,
       });
     }
     self.postMessage({
@@ -49,47 +63,9 @@ self.onmessage = async (event) => {
       confidence,
       bufferFill,
       processedTotal,
+      bestSyncCorr,
+      detectAttempts,
+      syncCandidates,
     });
-  }
-  if (msg.type === "debug_band" && detector) {
-    const samples = msg.samples;
-    if (samples && samples.length >= 1024) {
-      const frame = 1024;
-      const hop = 512;
-      const binFreq = sampleRate / frame;
-      const minBin = Math.max(0, Math.ceil(860 / binFreq));
-      const maxBin = Math.min(frame / 2, Math.floor(4300 / binFreq));
-      let sumPower = 0;
-      let count = 0;
-      const cosTable = new Float32Array(frame);
-      const sinTable = new Float32Array(frame);
-      for (let n = 0; n < frame; n++) {
-        const a = (2 * Math.PI * n) / frame;
-        cosTable[n] = Math.cos(a);
-        sinTable[n] = Math.sin(a);
-      }
-      for (let offset = 0; offset + frame <= samples.length; offset += hop) {
-        const re = new Float32Array(frame);
-        for (let i = 0; i < frame; i++) {
-          const w = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (frame - 1));
-          re[i] = samples[offset + i] * w;
-        }
-        for (let k = minBin; k <= maxBin; k++) {
-          let sumRe = 0;
-          let sumIm = 0;
-          for (let n = 0; n < frame; n++) {
-            const idx = (k * n) % frame;
-            const c = cosTable[idx];
-            const s = sinTable[idx];
-            sumRe += re[n] * c;
-            sumIm += re[n] * s;
-          }
-          sumPower += sumRe * sumRe + sumIm * sumIm;
-        }
-        count += 1;
-      }
-      const avgPower = count > 0 ? sumPower / count : 0;
-      self.postMessage({ type: "debug_band", value: avgPower });
-    }
   }
 };

@@ -1,6 +1,7 @@
 
 
-const VERSION = "0.5.1";
+const VERSION = "0.6.5";
+console.log("[app.js] loaded, VERSION=" + VERSION);
 const PROCESS_INTERVAL_MS = 50;
 const MAX_SAMPLES_PER_TICK = 48000; // ~1s at 48kHz — allows catching up if backlog grows
 const MAX_QUEUE_SAMPLES = 48000 * 5; // cap backlog to ~5s to avoid UI slowdown
@@ -20,6 +21,12 @@ let listening = false;
 let processedSamplesTotal = 0;
 let workerProcessedTotal = 0;
 
+// --- Recording state ---
+let recording = false;
+let recordedChunks = [];
+let recordedSampleCount = 0;
+let recordedBlob = null;
+
 // DOM elements
 const startBtn = document.getElementById("start-btn");
 const stopBtn = document.getElementById("stop-btn");
@@ -38,38 +45,41 @@ const offlineFile = document.getElementById("offline-file");
 const offlineRun = document.getElementById("offline-run");
 const offlineStatus = document.getElementById("offline-status");
 const offlineDemo = document.getElementById("offline-demo");
+const offlineDownload = document.getElementById("offline-download");
+const playerToggle = document.getElementById("player-toggle");
+const playerStatus = document.getElementById("player-status");
+const playerSelect = document.getElementById("player-select");
 const debugToggle = document.getElementById("debug-toggle");
 const debugPanel = document.getElementById("debug-panel");
 const dbgRms = document.getElementById("dbg-rms");
 const dbgPeak = document.getElementById("dbg-peak");
-const dbgRmsPre = document.getElementById("dbg-rms-pre");
-const dbgPeakPre = document.getElementById("dbg-peak-pre");
 const dbgBand = document.getElementById("dbg-band");
-const dbgBandPost = document.getElementById("dbg-band-post");
 const dbgQueued = document.getElementById("dbg-queued");
 const dbgProcessed = document.getElementById("dbg-processed");
 const dbgBatch = document.getElementById("dbg-batch");
-const signalWarning = document.getElementById("signal-warning");
+const dbgDetectAttempts = document.getElementById("dbg-detect-attempts");
+const dbgSyncCorr = document.getElementById("dbg-sync-corr");
+const dbgSyncCandidates = document.getElementById("dbg-sync-candidates");
 const vuBar = document.getElementById("vu-bar");
-const constraintsInfo = document.getElementById("constraints-info");
 const clearLogBtn = document.getElementById("clear-log-btn");
+const recBtn = document.getElementById("rec-btn");
+const recDownload = document.getElementById("rec-download");
+const recStatus = document.getElementById("rec-status");
 
 document.getElementById("version-tag").textContent = `v${VERSION}`;
 
 clearLogBtn.addEventListener("click", () => {
   detectionLog.innerHTML = "";
+  payloadEl.textContent = "\u2014";
+  confidenceEl.textContent = "\u2014";
+  confidenceBar.style.width = "0%";
 });
-const gainSlider = document.getElementById("gain-slider");
-const gainValue = document.getElementById("gain-value");
-const autoGainToggle = document.getElementById("auto-gain-toggle");
-const autoGainValue = document.getElementById("auto-gain-value");
 
+debugToggle.checked = localStorage.getItem("agua-debug") === "1";
+debugPanel.style.display = debugToggle.checked ? "flex" : "none";
 debugToggle.addEventListener("change", () => {
   debugPanel.style.display = debugToggle.checked ? "flex" : "none";
-});
-
-gainSlider.addEventListener("input", () => {
-  gainValue.textContent = `${Number(gainSlider.value).toFixed(2)}x`;
+  localStorage.setItem("agua-debug", debugToggle.checked ? "1" : "0");
 });
 
 offlineFile.addEventListener("change", () => {
@@ -78,21 +88,44 @@ offlineFile.addEventListener("change", () => {
 
 async function runOfflineDetect(arrayBuf) {
   offlineStatus.textContent = "Decoding WAV...";
+  console.log("[offline] starting, arrayBuf size:", arrayBuf.byteLength);
   const ctx = new AudioContext({ sampleRate: 48000 });
   try {
     const audioBuf = await ctx.decodeAudioData(arrayBuf.slice(0));
+    console.log("[offline] decoded:", audioBuf.length, "frames @", audioBuf.sampleRate, "Hz, channels:", audioBuf.numberOfChannels);
     offlineStatus.textContent = `Decoded: ${audioBuf.length} frames @ ${audioBuf.sampleRate} Hz`;
     const channelData = audioBuf.getChannelData(0);
+
+    // Log signal stats
+    let sumSq = 0, peak = 0, minVal = 0, maxVal = 0;
+    for (let i = 0; i < channelData.length; i++) {
+      const v = channelData[i];
+      sumSq += v * v;
+      if (v > maxVal) maxVal = v;
+      if (v < minVal) minVal = v;
+      const av = Math.abs(v);
+      if (av > peak) peak = av;
+    }
+    const rms = Math.sqrt(sumSq / channelData.length);
+    console.log("[offline] signal stats: rms=", rms.toFixed(6), "peak=", peak.toFixed(6), "min=", minVal.toFixed(6), "max=", maxVal.toFixed(6));
+    console.log("[offline] first 20 samples:", Array.from(channelData.slice(0, 20)).map(v => v.toFixed(6)));
+
     const chunkSize = 4096;
     const offlineWorker = new Worker(`worker.js?v=${VERSION}`, { type: "module" });
+    const key = keyInput.value.trim() || DEFAULT_KEY;
+    console.log("[offline] init worker: key='" + key + "', sampleRate=", audioBuf.sampleRate, ", preprocess=false");
     await new Promise((resolve) => {
       offlineWorker.onmessage = (event) => {
         const msg = event.data || {};
-        if (msg.type === "ready") resolve();
+        if (msg.type === "ready") {
+          console.log("[offline] worker ready");
+          resolve();
+        }
+        if (msg.type === "info") console.log("[offline worker]", msg.message);
       };
       offlineWorker.postMessage({
         type: "init",
-        key: keyInput.value.trim() || DEFAULT_KEY,
+        key,
         sampleRate: audioBuf.sampleRate,
         preprocess: false,
       });
@@ -101,6 +134,7 @@ async function runOfflineDetect(arrayBuf) {
     let detected = null;
     let confidence = 0;
     const totalChunks = Math.ceil(channelData.length / chunkSize);
+    console.log("[offline] processing", totalChunks, "chunks of", chunkSize, "samples");
     for (let i = 0; i < channelData.length; i += chunkSize) {
       const slice = channelData.subarray(i, Math.min(i + chunkSize, channelData.length));
       const chunk = new Float32Array(slice);
@@ -116,6 +150,9 @@ async function runOfflineDetect(arrayBuf) {
         offlineWorker.postMessage({ type: "process", samples: chunk }, [chunk.buffer]);
       });
       const idx = Math.floor(i / chunkSize) + 1;
+      if (idx % 50 === 0 || res.payload) {
+        console.log("[offline] chunk", idx + "/" + totalChunks, "bufferFill=", (res.bufferFill || 0).toFixed(3), "payload=", res.payload, "confidence=", res.confidence);
+      }
       if (idx % 200 === 0) {
         const pct = ((idx / totalChunks) * 100).toFixed(1);
         offlineStatus.textContent = `Processing... ${pct}%`;
@@ -123,9 +160,11 @@ async function runOfflineDetect(arrayBuf) {
       if (res.payload) {
         detected = res.payload;
         confidence = res.confidence || 0;
+        console.log("[offline] DETECTED:", detected, "confidence:", confidence);
         break;
       }
     }
+    console.log("[offline] loop done, detected=", detected);
     offlineWorker.terminate();
     if (detected) {
       offlineStatus.textContent = `Detected payload ${detected} (confidence ${(confidence * 100).toFixed(1)}%)`;
@@ -152,8 +191,9 @@ offlineRun.addEventListener("click", async () => {
 });
 
 offlineDemo.addEventListener("click", async () => {
+  const demoFile = playerSelect.value;
   offlineStatus.textContent = "Downloading demo WAV...";
-  const url = new URL("demo.wav", window.location.href).toString();
+  const url = new URL(`${demoFile}?v=${VERSION}`, window.location.href).toString();
   const res = await fetch(url);
   if (!res.ok) {
     offlineStatus.textContent = `Download failed: ${res.status}`;
@@ -161,6 +201,86 @@ offlineDemo.addEventListener("click", async () => {
   }
   const arrayBuf = await res.arrayBuffer();
   await runOfflineDetect(arrayBuf);
+});
+
+offlineDownload.addEventListener("click", () => {
+  const demoFile = playerSelect.value;
+  const a = document.createElement("a");
+  a.href = `${demoFile}?v=${VERSION}`;
+  a.download = demoFile;
+  a.click();
+});
+
+// --- Demo player (loop playback through speakers) ---
+let playerAudioBuf = null;
+let playerCtx = null;
+let playerSource = null;
+let playerPlaying = false;
+
+playerToggle.addEventListener("click", async () => {
+  if (playerPlaying) {
+    // Stop
+    if (playerSource) {
+      playerSource.stop();
+      playerSource = null;
+    }
+    if (playerCtx) {
+      playerCtx.close();
+      playerCtx = null;
+    }
+    playerPlaying = false;
+    playerToggle.textContent = "Play demo";
+    playerStatus.textContent = "Stopped";
+    return;
+  }
+
+  try {
+    playerStatus.textContent = "Loading...";
+    if (!playerAudioBuf) {
+      const res = await fetch(new URL(`${playerSelect.value}?v=${VERSION}`, window.location.href).toString());
+      if (!res.ok) {
+        playerStatus.textContent = "Download failed: " + res.status;
+        return;
+      }
+      const arrayBuf = await res.arrayBuffer();
+      const tmpCtx = new AudioContext({ sampleRate: 48000 });
+      playerAudioBuf = await tmpCtx.decodeAudioData(arrayBuf);
+      tmpCtx.close();
+    }
+
+    playerCtx = new AudioContext({ sampleRate: 48000 });
+    playerSource = playerCtx.createBufferSource();
+    playerSource.buffer = playerAudioBuf;
+    playerSource.loop = true;
+    playerSource.connect(playerCtx.destination);
+    playerSource.start();
+    playerPlaying = true;
+    playerToggle.textContent = "Stop demo";
+    playerStatus.textContent = "Playing (loop)";
+
+    playerSource.onended = () => {
+      // Only fires if stop() wasn't called manually (shouldn't happen with loop)
+      playerPlaying = false;
+      playerToggle.textContent = "Play demo";
+      playerStatus.textContent = "Stopped";
+    };
+  } catch (err) {
+    playerStatus.textContent = "Error: " + err.message;
+    console.error("[player]", err);
+  }
+});
+
+playerSelect.addEventListener("change", () => {
+  playerAudioBuf = null;
+  if (playerPlaying) {
+    // Stop current playback, then restart with new file
+    if (playerSource) { playerSource.stop(); playerSource = null; }
+    if (playerCtx) { playerCtx.close(); playerCtx = null; }
+    playerPlaying = false;
+    playerToggle.textContent = "Play demo";
+    playerStatus.textContent = "Switching...";
+    playerToggle.click();
+  }
 });
 
 function setStatus(text, state) {
@@ -213,25 +333,6 @@ function processSamples() {
     offset += sampleChunks[i].length;
   }
 
-  let gain = Number(gainSlider.value);
-  if (autoGainToggle.checked) {
-    let sumSq = 0;
-    for (let i = 0; i < samples.length; i++) {
-      const v = samples[i];
-      sumSq += v * v;
-    }
-    const rms = Math.sqrt(sumSq / samples.length);
-    const target = 0.05;
-    autoGainValue.textContent = target.toFixed(2);
-    if (rms > 0) {
-      gain *= Math.min(target / rms, 20);
-    }
-  }
-  if (gain !== 1) {
-    for (let i = 0; i < samples.length; i++) {
-      samples[i] = Math.max(-1, Math.min(1, samples[i] * gain));
-    }
-  }
   sampleChunksReadIndex = chunksToTake;
   if (sampleChunksReadIndex > 64) {
     sampleChunks = sampleChunks.slice(sampleChunksReadIndex);
@@ -257,26 +358,7 @@ function processSamples() {
     dbgProcessed.textContent = processedSamplesTotal.toString();
     dbgBatch.textContent = samples.length.toString();
 
-    // Post-gain band energy using the same data as detector
-    if (detectorWorker) {
-      detectorWorker.postMessage({ type: "debug_band", samples: samples.slice(0, Math.min(samples.length, 4096)) });
-    }
-
     if (analyser && freqData) {
-      const td = new Float32Array(analyser.fftSize);
-      analyser.getFloatTimeDomainData(td);
-      let preSumSq = 0;
-      let prePeak = 0;
-      for (let i = 0; i < td.length; i++) {
-        const v = td[i];
-        preSumSq += v * v;
-        const av = Math.abs(v);
-        if (av > prePeak) prePeak = av;
-      }
-      const preRms = Math.sqrt(preSumSq / td.length);
-      dbgRmsPre.textContent = preRms.toFixed(5);
-      dbgPeakPre.textContent = prePeak.toFixed(5);
-
       analyser.getFloatFrequencyData(freqData);
       const binFreq = audioContext.sampleRate / analyser.fftSize;
       const minBin = Math.max(0, Math.ceil(860 / binFreq));
@@ -291,7 +373,6 @@ function processSamples() {
       }
       const avgPower = count > 0 ? sum / count : 0;
       dbgBand.textContent = avgPower.toExponential(3);
-      signalWarning.style.display = avgPower < 1e-8 ? "flex" : "none";
     }
   }
 
@@ -343,17 +424,18 @@ async function start() {
         parts.push(`agc=${settings.autoGainControl}`);
       if (settings.voiceIsolation !== undefined)
         parts.push(`vi=${settings.voiceIsolation}`);
-      constraintsInfo.textContent = "Input settings: " + parts.join(", ");
-      constraintsInfo.style.display = "block";
+      console.log("[audio] input settings:", parts.join(", "));
+      if (settings.sampleRate && settings.sampleRate < 44100) {
+        console.warn("[audio] device sample rate is", settings.sampleRate, "Hz (need 44100+)");
+      }
+      if (settings.noiseSuppression === true || settings.echoCancellation === true) {
+        console.warn("[audio] browser is applying DSP (NS/AEC) despite request to disable");
+      }
     }
 
     detectorWorker = new Worker(`worker.js?v=${VERSION}`, { type: "module" });
     detectorWorker.onmessage = (event) => {
       const msg = event.data || {};
-      if (msg.type === "debug_band") {
-        dbgBandPost.textContent = msg.value.toExponential(3);
-        return;
-      }
       if (msg.type === "info" && msg.message) {
         console.info(msg.message);
         return;
@@ -373,6 +455,11 @@ async function start() {
         bufferText.textContent = (fill * 100).toFixed(0) + "%";
         if (debugToggle.checked) {
           dbgProcessed.textContent = workerProcessedTotal.toString();
+          if (msg.detectAttempts !== undefined) {
+            dbgDetectAttempts.textContent = msg.detectAttempts;
+            dbgSyncCorr.textContent = (msg.bestSyncCorr ?? 0).toFixed(4);
+            dbgSyncCandidates.textContent = msg.syncCandidates ?? 0;
+          }
         }
         if (msg.payload) {
           payloadEl.textContent = msg.payload;
@@ -398,6 +485,17 @@ async function start() {
 
     workletNode.port.onmessage = (event) => {
       const chunk = event.data;
+
+      // Capture raw mic samples for recording (before any processing)
+      if (recording) {
+        recordedChunks.push(new Float32Array(chunk));
+        recordedSampleCount += chunk.length;
+        if (recordedSampleCount % 48000 < chunk.length) {
+          const secs = (recordedSampleCount / (audioContext ? audioContext.sampleRate : 48000)).toFixed(1);
+          recStatus.textContent = `Recording... ${secs}s`;
+        }
+      }
+
       sampleChunks.push(chunk);
       sampleChunksLength += chunk.length;
       if (sampleChunksLength > MAX_QUEUE_SAMPLES) {
@@ -430,6 +528,7 @@ async function start() {
     stopBtn.disabled = false;
     keyInput.disabled = true;
     deviceSelect.disabled = true;
+    recBtn.disabled = false;
     setStatus("Listening...", "listening");
   } catch (err) {
     setStatus("Error: " + err.message, "error");
@@ -466,12 +565,114 @@ function stop() {
   processedSamplesTotal = 0;
   workerProcessedTotal = 0;
 
+  // Stop any active recording
+  if (recording) {
+    recording = false;
+    recBtn.textContent = "Record";
+    recBtn.style.background = "";
+    recBtn.style.color = "";
+  }
+  recBtn.disabled = true;
+
   startBtn.disabled = false;
   stopBtn.disabled = true;
   keyInput.disabled = false;
   deviceSelect.disabled = false;
   setStatus("Stopped", "idle");
 }
+
+// --- Recording functions ---
+
+function encodeWav(samples, sampleRate) {
+  // 32-bit float WAV to preserve exact mic samples
+  const numChannels = 1;
+  const bytesPerSample = 4;
+  const dataSize = samples.length * bytesPerSample;
+  const headerSize = 44;
+  const buffer = new ArrayBuffer(headerSize + dataSize);
+  const view = new DataView(buffer);
+
+  function writeString(offset, str) {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  }
+
+  writeString(0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeString(8, "WAVE");
+  writeString(12, "fmt ");
+  view.setUint32(16, 16, true);            // fmt chunk size
+  view.setUint16(20, 3, true);             // format = IEEE float
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * numChannels * bytesPerSample, true);
+  view.setUint16(32, numChannels * bytesPerSample, true);
+  view.setUint16(34, bytesPerSample * 8, true);
+  writeString(36, "data");
+  view.setUint32(40, dataSize, true);
+
+  const output = new Float32Array(buffer, headerSize);
+  output.set(samples);
+
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
+recBtn.addEventListener("click", () => {
+  if (!listening) return;
+
+  if (!recording) {
+    // Start recording
+    recording = true;
+    recordedChunks = [];
+    recordedSampleCount = 0;
+    recordedBlob = null;
+    recBtn.textContent = "Stop rec";
+    recBtn.style.background = "var(--red)";
+    recBtn.style.color = "#fff";
+    recDownload.disabled = true;
+    recStatus.textContent = "Recording...";
+    console.log("[rec] started");
+  } else {
+    // Stop recording
+    recording = false;
+    recBtn.textContent = "Record";
+    recBtn.style.background = "";
+    recBtn.style.color = "";
+
+    if (recordedSampleCount === 0) {
+      recStatus.textContent = "No samples recorded";
+      return;
+    }
+
+    // Merge chunks into single Float32Array
+    const merged = new Float32Array(recordedSampleCount);
+    let off = 0;
+    for (const chunk of recordedChunks) {
+      merged.set(chunk, off);
+      off += chunk.length;
+    }
+
+    const sr = audioContext ? audioContext.sampleRate : 48000;
+    recordedBlob = encodeWav(merged, sr);
+    const durSec = (recordedSampleCount / sr).toFixed(1);
+    recStatus.textContent = `${durSec}s recorded (${recordedSampleCount} samples @ ${sr} Hz)`;
+    recDownload.disabled = false;
+    recordedChunks = [];
+    console.log("[rec] stopped:", recordedSampleCount, "samples,", durSec, "s");
+  }
+});
+
+recDownload.addEventListener("click", () => {
+  if (!recordedBlob) return;
+  const url = URL.createObjectURL(recordedBlob);
+  const a = document.createElement("a");
+  a.href = url;
+  const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  a.download = `agua-mic-${ts}.wav`;
+  a.click();
+  URL.revokeObjectURL(url);
+});
 
 async function enumerateDevices() {
   try {

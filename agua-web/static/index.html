@@ -179,17 +179,31 @@
   <h1>agua watermark detector <span id="version-tag" style="font-size:0.5em;font-weight:400;color:var(--text-dim)"></span></h1>
 
   <div class="card">
+    <div class="label">Demo player</div>
+    <div class="stats" style="margin-bottom:0.5rem;">
+      Play the watermarked demo through speakers to test acoustic detection via mic.
+    </div>
+    <div class="key-row">
+      <select id="player-select">
+        <option value="demo-s007.wav">Strength 0.07 (subtle)</option>
+        <option value="demo-s008.wav">Strength 0.08 (moderate)</option>
+        <option value="demo-s010.wav">Strength 0.10 (standard)</option>
+        <option value="demo-s015.wav" selected>Strength 0.15 (strong)</option>
+      </select>
+    </div>
+    <div class="key-row">
+      <button id="player-toggle">Play demo</button>
+      <span id="player-status" class="stats" style="margin:0;">&mdash;</span>
+    </div>
+  </div>
+
+  <div class="card">
     <div class="label">Input device</div>
     <div class="key-row">
       <select id="device-select">
         <option value="">Default</option>
       </select>
     </div>
-    <div class="stats" style="margin-top:0.35rem;color:#c0392b;">
-      Browser/OS may still apply DSP (AGC/NS/AEC), especially on iOS.
-    </div>
-    <div id="constraints-info" class="stats" style="margin-top:0.35rem;display:none;"></div>
-
     <div class="label">Key passphrase</div>
     <div class="key-row">
       <input type="text" id="key-input" placeholder="agua-default-key" value="agua-default-key">
@@ -198,6 +212,7 @@
     <div class="controls">
       <button id="start-btn">Start listening</button>
       <button id="stop-btn" disabled>Stop</button>
+      <button id="clear-log-btn">Clear</button>
     </div>
 
     <div class="status-row">
@@ -237,33 +252,27 @@
         <span>Show debug stats</span>
       </label>
     </div>
-    <div class="label" style="margin-top: 0.5rem;">Input gain</div>
-    <div class="stats" style="margin-bottom: 0.25rem;">
-      <input type="range" id="gain-slider" min="0.25" max="8" step="0.25" value="1" style="width:100%;">
-      <span id="gain-value" style="min-width:3rem;text-align:right;">1.00x</span>
-    </div>
-    <div class="stats" style="margin-bottom: 0.25rem;">
-      <label style="display:flex;gap:0.5rem;align-items:center;">
-        <input type="checkbox" id="auto-gain-toggle">
-        <span>Auto gain (target RMS)</span>
-      </label>
-      <span id="auto-gain-value" style="min-width:3rem;text-align:right;">0.05</span>
-    </div>
-    <div id="signal-warning" class="stats" style="display:none;color:#c0392b;">
-      Signal too low for detection
-    </div>
     <div class="label" style="margin-top: 0.5rem;">VU meter</div>
     <div class="progress-container">
       <div id="vu-bar" class="progress-bar confidence"></div>
     </div>
     <div id="debug-panel" class="stats" style="display:none;flex-direction:column;gap:0.25rem;">
-      <div>RMS pre-gain: <span id="dbg-rms-pre">&mdash;</span> Peak pre-gain: <span id="dbg-peak-pre">&mdash;</span></div>
-      <div>RMS post-gain: <span id="dbg-rms">&mdash;</span> Peak post-gain: <span id="dbg-peak">&mdash;</span></div>
-      <div>Band energy pre-gain: <span id="dbg-band">&mdash;</span></div>
-      <div>Band energy post-gain: <span id="dbg-band-post">&mdash;</span></div>
-      <div>Queued samples: <span id="dbg-queued">&mdash;</span></div>
-      <div>Processed samples: <span id="dbg-processed">&mdash;</span></div>
-      <div>Last process batch: <span id="dbg-batch">&mdash;</span></div>
+      <div>RMS: <span id="dbg-rms">&mdash;</span> Peak: <span id="dbg-peak">&mdash;</span></div>
+      <div>Band energy: <span id="dbg-band">&mdash;</span></div>
+      <div>Queued: <span id="dbg-queued">&mdash;</span> Processed: <span id="dbg-processed">&mdash;</span> Batch: <span id="dbg-batch">&mdash;</span></div>
+      <div>Detect attempts: <span id="dbg-detect-attempts">&mdash;</span> Best sync corr: <span id="dbg-sync-corr">&mdash;</span> Candidates: <span id="dbg-sync-candidates">&mdash;</span></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="label">Record mic input</div>
+    <div class="stats" style="margin-bottom:0.5rem;">
+      Capture raw mic audio (before detector processing) as WAV for analysis.
+    </div>
+    <div class="key-row">
+      <button id="rec-btn" disabled>Record</button>
+      <button id="rec-download" disabled>Download WAV</button>
+      <span id="rec-status" class="stats" style="margin:0;">&mdash;</span>
     </div>
   </div>
 
@@ -275,19 +284,19 @@
     <div class="key-row">
       <input type="file" id="offline-file" accept=".wav,audio/wav">
       <button id="offline-run" disabled>Run detect</button>
+    </div>
+    <div class="key-row" style="margin-top:0.4rem;">
       <button id="offline-demo">Load demo WAV</button>
+      <button id="offline-download">Download demo WAV</button>
     </div>
     <div class="stats" id="offline-status">&mdash;</div>
   </div>
 
   <div class="card">
-    <div class="label" style="display:flex;justify-content:space-between;align-items:center;">
-      Detection log
-      <button id="clear-log-btn" style="font-size:0.7rem;padding:0.2rem 0.5rem;background:var(--border);color:var(--text-dim);">Clear</button>
-    </div>
+    <div class="label">Detection log</div>
     <div id="detection-log" class="log-section"></div>
   </div>
 
-  <script type="module" src="app.js?v=0.5.1"></script>
+  <script type="module" src="app.js?v=0.6.5"></script>
 </body>
 </html>
