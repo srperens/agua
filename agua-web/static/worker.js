@@ -1,5 +1,4 @@
-const v = new URL(import.meta.url).searchParams.get("v") || "";
-const { default: init, WasmDetector } = await import(`./pkg/agua_web.js${v ? `?v=${v}` : ""}`);
+import init, { WasmDetector } from "./pkg/agua_web.js";
 
 let detector = null;
 let processedTotal = 0;
@@ -9,14 +8,18 @@ let sampleRate = 48000;
 self.onmessage = async (event) => {
   const msg = event.data || {};
   if (msg.type === "init") {
-    await init();
-    detector = new WasmDetector(msg.key, msg.sampleRate);
-    sampleRate = msg.sampleRate;
-    self.postMessage({
-      type: "info",
-      message: `worker init: sampleRate=${msg.sampleRate}`,
-    });
-    self.postMessage({ type: "ready" });
+    try {
+      await init();
+      detector = new WasmDetector(msg.key, msg.sampleRate);
+      sampleRate = msg.sampleRate;
+      self.postMessage({
+        type: "info",
+        message: `worker init: sampleRate=${msg.sampleRate}`,
+      });
+      self.postMessage({ type: "ready" });
+    } catch (err) {
+      self.postMessage({ type: "info", message: `worker init FAILED: ${err}` });
+    }
     return;
   }
   if (msg.type === "process" && detector) {

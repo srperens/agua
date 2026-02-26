@@ -147,7 +147,7 @@ offlineRun.addEventListener("click", async () => {
 
 offlineDemo.addEventListener("click", async () => {
   offlineStatus.textContent = "Downloading demo WAV...";
-  const url = new URL("cli_music_embedded_48k_default.wav", window.location.href).toString();
+  const url = new URL("demo.wav", window.location.href).toString();
   const res = await fetch(url);
   if (!res.ok) {
     offlineStatus.textContent = `Download failed: ${res.status}`;
@@ -179,6 +179,16 @@ function addDetection(payload, confidence) {
 }
 
 function processSamples() {
+  // VU meter — always active, even before worker is ready
+  if (analyser && sampleChunksLength > 0) {
+    const td = new Float32Array(analyser.fftSize);
+    analyser.getFloatTimeDomainData(td);
+    let sumSq = 0;
+    for (let i = 0; i < td.length; i++) sumSq += td[i] * td[i];
+    const vu = Math.min(Math.sqrt(sumSq / td.length) * 10, 1);
+    vuBar.style.width = (vu * 100).toFixed(1) + "%";
+  }
+
   if (!detectorReady || sampleChunksLength === 0) return;
 
   // Drain at most MAX_SAMPLES_PER_TICK to keep the main thread responsive.
@@ -224,28 +234,6 @@ function processSamples() {
   sampleChunksLength -= toProcess;
 
   processedSamplesTotal += samples.length;
-
-  // VU meter — always active (uses pre-gain analyser when available)
-  {
-    let vuRms = 0;
-    if (analyser) {
-      const td = new Float32Array(analyser.fftSize);
-      analyser.getFloatTimeDomainData(td);
-      let preSumSq = 0;
-      for (let i = 0; i < td.length; i++) {
-        preSumSq += td[i] * td[i];
-      }
-      vuRms = Math.sqrt(preSumSq / td.length);
-    } else {
-      let sumSq = 0;
-      for (let i = 0; i < samples.length; i++) {
-        sumSq += samples[i] * samples[i];
-      }
-      vuRms = Math.sqrt(sumSq / samples.length);
-    }
-    const vu = Math.min(vuRms * 10, 1);
-    vuBar.style.width = (vu * 100).toFixed(1) + "%";
-  }
 
   if (debugToggle.checked) {
     let sumSq = 0;
