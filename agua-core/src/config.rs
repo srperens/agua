@@ -4,17 +4,17 @@ pub struct WatermarkConfig {
     /// Sample rate in Hz (e.g. 44100, 48000).
     pub sample_rate: u32,
     /// Watermark embedding strength (power-law exponent delta).
-    /// Higher = more robust but more audible. Default: 0.02.
+    /// Higher = more robust but more audible. Default: 0.1.
     pub strength: f32,
     /// FFT frame size in samples. Must be power of 2. Default: 1024.
     pub frame_size: usize,
-    /// Number of frequency bin pairs per frame. Default: 30.
+    /// Number of frequency bin pairs per frame. Default: 60.
     pub num_bin_pairs: usize,
     /// Minimum frequency in Hz for watermark embedding. Default: 860.0.
     pub min_freq_hz: f32,
     /// Maximum frequency in Hz for watermark embedding. Default: 4300.0.
     pub max_freq_hz: f32,
-    /// Spacing between bins in each pair. Default: 1 (adjacent bins).
+    /// Spacing between bins in each pair. Default: 4.
     /// Higher values spread pairs across wider frequency gaps, improving
     /// resilience to comb filtering from multi-speaker playback.
     pub bin_spacing: usize,
@@ -55,7 +55,6 @@ impl WatermarkConfig {
     pub fn acoustic() -> Self {
         Self {
             strength: 0.08,
-            bin_spacing: 4,
             ..Self::default()
         }
     }

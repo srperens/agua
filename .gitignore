@@ -8,5 +8,4 @@
 .vscode/
 .claude/
 *.wav
-!agua-web/static/demo-s*.wav
 *.mp3

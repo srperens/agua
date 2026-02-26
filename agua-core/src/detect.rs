@@ -366,7 +366,7 @@ pub fn detect_single_offset_with_diagnostics(
     candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(core::cmp::Ordering::Equal));
 
     // Limit Viterbi attempts (expensive with K=15)
-    let max_attempts = MAX_DECODE_ATTEMPTS.min(5);
+    let max_attempts = MAX_DECODE_ATTEMPTS;
     diag.viterbi_attempts = candidates.len().min(max_attempts) as u32;
 
     for &(start, corr) in candidates.iter().take(max_attempts) {
