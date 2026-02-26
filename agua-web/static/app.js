@@ -225,6 +225,28 @@ function processSamples() {
 
   processedSamplesTotal += samples.length;
 
+  // VU meter — always active (uses pre-gain analyser when available)
+  {
+    let vuRms = 0;
+    if (analyser) {
+      const td = new Float32Array(analyser.fftSize);
+      analyser.getFloatTimeDomainData(td);
+      let preSumSq = 0;
+      for (let i = 0; i < td.length; i++) {
+        preSumSq += td[i] * td[i];
+      }
+      vuRms = Math.sqrt(preSumSq / td.length);
+    } else {
+      let sumSq = 0;
+      for (let i = 0; i < samples.length; i++) {
+        sumSq += samples[i] * samples[i];
+      }
+      vuRms = Math.sqrt(sumSq / samples.length);
+    }
+    const vu = Math.min(vuRms * 10, 1);
+    vuBar.style.width = (vu * 100).toFixed(1) + "%";
+  }
+
   if (debugToggle.checked) {
     let sumSq = 0;
     let peak = 0;
@@ -240,7 +262,6 @@ function processSamples() {
     dbgQueued.textContent = sampleChunksLength.toString();
     dbgProcessed.textContent = processedSamplesTotal.toString();
     dbgBatch.textContent = samples.length.toString();
-    let vuRms = rms;
 
     // Post-gain band energy using the same data as detector
     if (detectorWorker) {
@@ -261,7 +282,6 @@ function processSamples() {
       const preRms = Math.sqrt(preSumSq / td.length);
       dbgRmsPre.textContent = preRms.toFixed(5);
       dbgPeakPre.textContent = prePeak.toFixed(5);
-      vuRms = preRms;
 
       analyser.getFloatFrequencyData(freqData);
       const binFreq = audioContext.sampleRate / analyser.fftSize;
@@ -279,9 +299,6 @@ function processSamples() {
       dbgBand.textContent = avgPower.toExponential(3);
       signalWarning.style.display = avgPower < 1e-8 ? "flex" : "none";
     }
-
-    const vu = Math.min(vuRms * 10, 1);
-    vuBar.style.width = (vu * 100).toFixed(1) + "%";
   }
 
   detectorWorker.postMessage(
