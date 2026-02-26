@@ -87,6 +87,7 @@ pub fn embed_parallel_with_offset(
                     let global_frame = frame_offset as usize + frame_idx;
                     let bit_idx = global_frame % block_len;
                     let bit = block_bits[bit_idx];
+                    let bin_pair_seed = sync::bin_pair_seed(bit_idx);
 
                     let offset = frame_idx * hop_size;
                     let mut buf = vec![0.0f32; frame_size];
@@ -99,13 +100,7 @@ pub fn embed_parallel_with_offset(
                     }
 
                     fft.forward(&mut buf).expect("FFT forward should not fail");
-                    patchwork::embed_frame(
-                        fft.freq_bins_mut(),
-                        bit,
-                        key,
-                        global_frame as u32,
-                        config,
-                    );
+                    patchwork::embed_frame(fft.freq_bins_mut(), bit, key, bin_pair_seed, config);
                     fft.inverse(&mut buf).expect("FFT inverse should not fail");
                     fft.normalize(&mut buf);
 
@@ -144,6 +139,10 @@ pub fn detect_parallel(
 }
 
 /// Detect watermarks in audio samples in parallel, starting at a frame offset.
+///
+/// Two-pass approach matching the sequential detect:
+/// - Pass 1: Compute soft values with constant seed 0 (parallel FFT) for sync search
+/// - Pass 2: Recompute data soft values with correct block-relative seeds for Viterbi
 pub fn detect_parallel_with_offset(
     samples: &[f32],
     key: &WatermarkKey,
@@ -166,43 +165,41 @@ pub fn detect_parallel_with_offset(
     let coded_bits_count = codec::CODED_BITS;
     let window = hann_window(frame_size);
 
-    // Parallel FFT + soft-value extraction in batches.
-    // Each frame reads from the input (no mutation), so parallelism is safe.
+    // Pass 1: Parallel FFT + soft-value extraction with constant seed 0.
+    // Accurate for sync frames, approximate for data frames (used only for sync search).
     let frame_indices: Vec<usize> = (0..num_frames).collect();
-    let soft_values: Vec<f32> = frame_indices
+    let sync_soft_values: Vec<f32> = frame_indices
         .par_chunks(BATCH_SIZE)
         .flat_map(|batch| {
             let mut fft = FftProcessor::new(frame_size).expect("FFT init should not fail");
             batch
                 .iter()
                 .map(|&frame_idx| {
-                    let global_frame = frame_offset as usize + frame_idx;
                     let offset = frame_idx * hop_size;
 
                     let mut buf = vec![0.0f32; frame_size];
                     let end = (offset + frame_size).min(samples.len());
                     buf[..end - offset].copy_from_slice(&samples[offset..end]);
 
-                    // Hann analysis window
                     for (i, s) in buf.iter_mut().enumerate() {
                         *s *= window[i];
                     }
 
                     fft.forward(&mut buf).expect("FFT forward should not fail");
-                    patchwork::detect_frame(fft.freq_bins(), key, global_frame as u32, config)
+                    patchwork::detect_frame(fft.freq_bins(), key, 0, config)
                 })
                 .collect::<Vec<_>>()
         })
         .collect();
 
-    // Sequential sync search + Viterbi decode (best-first, matches detect.rs)
+    // Sync search + two-pass Viterbi decode
     let mut results = Vec::new();
 
     if num_frames >= frames_per_block {
         let scan_end = num_frames - frames_per_block;
         let mut candidates: Vec<(usize, f32)> = (0..=scan_end)
             .map(|start| {
-                let sync_soft = &soft_values[start..start + SYNC_PATTERN_BITS];
+                let sync_soft = &sync_soft_values[start..start + SYNC_PATTERN_BITS];
                 let corr = correlate_sync(sync_soft, &sync_pattern);
                 (start, corr)
             })
@@ -218,8 +215,35 @@ pub fn detect_parallel_with_offset(
                 continue;
             }
 
-            let data_soft = &soft_values[data_start..data_end];
-            let decoded_bits = codec::decode(data_soft);
+            // Pass 2: Recompute data soft values with correct block-relative seeds
+            let data_frame_indices: Vec<usize> = (data_start..data_end).collect();
+            let data_soft: Vec<f32> = data_frame_indices
+                .par_chunks(BATCH_SIZE)
+                .flat_map(|batch| {
+                    let mut fft = FftProcessor::new(frame_size).expect("FFT init should not fail");
+                    batch
+                        .iter()
+                        .map(|&frame_idx| {
+                            let data_pos = frame_idx - data_start;
+                            let seed = sync::bin_pair_seed(SYNC_PATTERN_BITS + data_pos);
+                            let offset = frame_idx * hop_size;
+
+                            let mut buf = vec![0.0f32; frame_size];
+                            let end = (offset + frame_size).min(samples.len());
+                            buf[..end - offset].copy_from_slice(&samples[offset..end]);
+
+                            for (i, s) in buf.iter_mut().enumerate() {
+                                *s *= window[i];
+                            }
+
+                            fft.forward(&mut buf).expect("FFT forward should not fail");
+                            patchwork::detect_frame(fft.freq_bins(), key, seed, config)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+
+            let decoded_bits = codec::decode(&data_soft);
 
             if let Ok(payload) = Payload::decode_with_crc(&decoded_bits) {
                 results.push(DetectionResult {
@@ -231,15 +255,42 @@ pub fn detect_parallel_with_offset(
             }
         }
 
-        // Fallback: try offset 0 directly (no sync threshold)
+        // Fallback: try offset 0 directly
         if results.is_empty() {
             let data_start = SYNC_PATTERN_BITS;
             let data_end = data_start + coded_bits_count;
             if data_end <= num_frames {
-                let data_soft = &soft_values[data_start..data_end];
-                let decoded_bits = codec::decode(data_soft);
+                let data_frame_indices: Vec<usize> = (data_start..data_end).collect();
+                let data_soft: Vec<f32> = data_frame_indices
+                    .par_chunks(BATCH_SIZE)
+                    .flat_map(|batch| {
+                        let mut fft =
+                            FftProcessor::new(frame_size).expect("FFT init should not fail");
+                        batch
+                            .iter()
+                            .map(|&frame_idx| {
+                                let data_pos = frame_idx - data_start;
+                                let seed = sync::bin_pair_seed(SYNC_PATTERN_BITS + data_pos);
+                                let offset = frame_idx * hop_size;
+
+                                let mut buf = vec![0.0f32; frame_size];
+                                let end = (offset + frame_size).min(samples.len());
+                                buf[..end - offset].copy_from_slice(&samples[offset..end]);
+
+                                for (i, s) in buf.iter_mut().enumerate() {
+                                    *s *= window[i];
+                                }
+
+                                fft.forward(&mut buf).expect("FFT forward should not fail");
+                                patchwork::detect_frame(fft.freq_bins(), key, seed, config)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+
+                let decoded_bits = codec::decode(&data_soft);
                 if let Ok(payload) = Payload::decode_with_crc(&decoded_bits) {
-                    let sync_soft = &soft_values[0..SYNC_PATTERN_BITS];
+                    let sync_soft = &sync_soft_values[0..SYNC_PATTERN_BITS];
                     let corr = correlate_sync(sync_soft, &sync_pattern);
                     results.push(DetectionResult {
                         payload,
