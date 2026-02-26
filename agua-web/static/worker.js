@@ -1,4 +1,5 @@
-import init, { WasmDetector } from "./pkg/agua_web.js?v=0.4.0";
+const v = new URL(import.meta.url).searchParams.get("v") || "";
+const { default: init, WasmDetector } = await import(`./pkg/agua_web.js${v ? `?v=${v}` : ""}`);
 
 let detector = null;
 let processedTotal = 0;

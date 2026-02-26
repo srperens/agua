@@ -1,5 +1,6 @@
 
 
+const VERSION = "0.4.0";
 const PROCESS_INTERVAL_MS = 50;
 const MAX_SAMPLES_PER_TICK = 48000; // ~1s at 48kHz — allows catching up if backlog grows
 const MAX_QUEUE_SAMPLES = 48000 * 5; // cap backlog to ~5s to avoid UI slowdown
@@ -51,6 +52,8 @@ const dbgBatch = document.getElementById("dbg-batch");
 const signalWarning = document.getElementById("signal-warning");
 const vuBar = document.getElementById("vu-bar");
 const constraintsInfo = document.getElementById("constraints-info");
+
+document.getElementById("version-tag").textContent = `v${VERSION}`;
 const gainSlider = document.getElementById("gain-slider");
 const gainValue = document.getElementById("gain-value");
 const autoGainToggle = document.getElementById("auto-gain-toggle");
@@ -76,7 +79,7 @@ async function runOfflineDetect(arrayBuf) {
     offlineStatus.textContent = `Decoded: ${audioBuf.length} frames @ ${audioBuf.sampleRate} Hz`;
     const channelData = audioBuf.getChannelData(0);
     const chunkSize = 4096;
-    const offlineWorker = new Worker("worker.js?v=0.4.0", { type: "module" });
+    const offlineWorker = new Worker(`worker.js?v=${VERSION}`, { type: "module" });
     await new Promise((resolve) => {
       offlineWorker.onmessage = (event) => {
         const msg = event.data || {};
@@ -333,7 +336,7 @@ async function start() {
       constraintsInfo.style.display = "block";
     }
 
-    detectorWorker = new Worker("worker.js?v=0.4.0", { type: "module" });
+    detectorWorker = new Worker(`worker.js?v=${VERSION}`, { type: "module" });
     detectorWorker.onmessage = (event) => {
       const msg = event.data || {};
       if (msg.type === "debug_band") {
@@ -375,7 +378,7 @@ async function start() {
     };
     detectorWorker.postMessage({ type: "init", key, sampleRate });
 
-    await audioContext.audioWorklet.addModule("processor.js?v=0.4.0");
+    await audioContext.audioWorklet.addModule(`processor.js?v=${VERSION}`);
     const source = audioContext.createMediaStreamSource(stream);
     analyser = audioContext.createAnalyser();
     analyser.fftSize = 4096;
