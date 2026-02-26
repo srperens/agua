@@ -370,3 +370,190 @@ fn streaming_strength_sweep() {
         );
     }
 }
+
+// ── Acoustic simulation helpers (duplicated from acoustic_simulation.rs) ──
+
+fn lowpass_filter(samples: &[f32], sample_rate: u32, cutoff_hz: f32, tap_count: usize) -> Vec<f32> {
+    let tap_count = if tap_count % 2 == 0 {
+        tap_count + 1
+    } else {
+        tap_count
+    };
+    let half = tap_count / 2;
+    let fc = cutoff_hz / sample_rate as f32;
+    let mut kernel = vec![0.0f32; tap_count];
+    for (i, k) in kernel.iter_mut().enumerate() {
+        let n = i as f32 - half as f32;
+        let sinc = if n.abs() < 1e-10 {
+            2.0 * std::f32::consts::PI * fc
+        } else {
+            (2.0 * std::f32::consts::PI * fc * n).sin() / n
+        };
+        let w = 0.42 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (tap_count - 1) as f32).cos()
+            + 0.08 * (4.0 * std::f32::consts::PI * i as f32 / (tap_count - 1) as f32).cos();
+        *k = sinc * w;
+    }
+    let sum: f32 = kernel.iter().sum();
+    if sum.abs() > 1e-10 {
+        for k in kernel.iter_mut() {
+            *k /= sum;
+        }
+    }
+    let n = samples.len();
+    let mut output = vec![0.0f32; n];
+    for (i, out) in output.iter_mut().enumerate() {
+        let mut acc = 0.0f32;
+        for (j, &k) in kernel.iter().enumerate() {
+            let idx = i as isize + j as isize - half as isize;
+            if idx >= 0 && (idx as usize) < n {
+                acc += samples[idx as usize] * k;
+            }
+        }
+        *out = acc;
+    }
+    output
+}
+
+fn add_white_noise(samples: &mut [f32], snr_db: f32) {
+    let signal_power: f32 = samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32;
+    let noise_power = signal_power / 10.0f32.powf(snr_db / 10.0);
+    let noise_std = noise_power.sqrt();
+    let mut state: u32 = 0xDEAD_BEEF;
+    for s in samples.iter_mut() {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        let u1 = (state as f32) / u32::MAX as f32;
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        let u2 = (state as f32) / u32::MAX as f32;
+        let noise =
+            noise_std * (-2.0 * u1.max(1e-10).ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
+        *s += noise;
+    }
+}
+
+fn resample_jitter(samples: &[f32], ratio: f32) -> Vec<f32> {
+    let intermediate_len = (samples.len() as f32 * ratio) as usize;
+    let mut intermediate = vec![0.0f32; intermediate_len];
+    for (i, val) in intermediate.iter_mut().enumerate() {
+        let src_pos = i as f32 / ratio;
+        let idx = src_pos as usize;
+        let frac = src_pos - idx as f32;
+        if idx + 1 < samples.len() {
+            *val = samples[idx] * (1.0 - frac) + samples[idx + 1] * frac;
+        } else if idx < samples.len() {
+            *val = samples[idx];
+        }
+    }
+    let output_len = samples.len();
+    let inv_ratio = intermediate_len as f32 / output_len as f32;
+    let mut output = vec![0.0f32; output_len];
+    for (i, out) in output.iter_mut().enumerate() {
+        let src_pos = i as f32 * inv_ratio;
+        let idx = src_pos as usize;
+        let frac = src_pos - idx as f32;
+        if idx + 1 < intermediate.len() {
+            *out = intermediate[idx] * (1.0 - frac) + intermediate[idx + 1] * frac;
+        } else if idx < intermediate.len() {
+            *out = intermediate[idx];
+        }
+    }
+    output
+}
+
+/// Sweep bin_spacing × strength, both digital and through simulated acoustic channel.
+///
+/// Run with: `cargo test bin_spacing_sweep -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn bin_spacing_sweep() {
+    use agua_core::PreProcessor;
+
+    let key = WatermarkKey::new(&[42u8; 16]).unwrap();
+    let payload = Payload::new([
+        0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC,
+        0xBA, 0x98,
+    ]);
+
+    let sample_rate = 48000u32;
+    let num_samples = sample_rate as usize * 25;
+    let spacings: &[usize] = &[1, 2, 3, 4, 6, 8, 12, 16];
+    let strengths: &[f32] = &[0.02, 0.05, 0.08, 0.10];
+
+    // ── Digital (clean) ──
+    println!();
+    println!("=== Digital (no degradation) ===");
+    print!("{:<10}", "Spacing");
+    for &s in strengths {
+        print!("{:<12}", format!("s={:.2}", s));
+    }
+    println!();
+    println!("{}", "-".repeat(10 + strengths.len() * 12));
+
+    for &spacing in spacings {
+        print!("{:<10}", spacing);
+        for &strength in strengths {
+            let config = WatermarkConfig {
+                strength,
+                bin_spacing: spacing,
+                sample_rate,
+                ..WatermarkConfig::default()
+            };
+
+            let mut audio = make_test_audio(num_samples, sample_rate);
+            agua_core::embed(&mut audio, &payload, &key, &config).unwrap();
+
+            match agua_core::detect(&audio, &key, &config) {
+                Ok(r) if !r.is_empty() && r[0].payload == payload => {
+                    print!("{:<12}", format!("{:.4}", r[0].confidence));
+                }
+                Ok(_) => print!("{:<12}", "WRONG"),
+                Err(_) => print!("{:<12}", "FAIL"),
+            }
+        }
+        println!();
+    }
+
+    // ── Acoustic simulation (LP 8kHz + noise 20dB + jitter + preprocess) ──
+    println!();
+    println!("=== Acoustic simulation (LP 8kHz + noise 20dB + jitter 0.1%) ===");
+    print!("{:<10}", "Spacing");
+    for &s in strengths {
+        print!("{:<12}", format!("s={:.2}", s));
+    }
+    println!();
+    println!("{}", "-".repeat(10 + strengths.len() * 12));
+
+    for &spacing in spacings {
+        print!("{:<10}", spacing);
+        for &strength in strengths {
+            let config = WatermarkConfig {
+                strength,
+                bin_spacing: spacing,
+                sample_rate,
+                ..WatermarkConfig::default()
+            };
+
+            let mut audio = make_test_audio(num_samples, sample_rate);
+            agua_core::embed(&mut audio, &payload, &key, &config).unwrap();
+
+            // Simulate acoustic channel
+            let mut degraded = lowpass_filter(&audio, sample_rate, 8000.0, 127);
+            add_white_noise(&mut degraded, 20.0);
+            let mut degraded = resample_jitter(&degraded, 1.001);
+            let mut preprocessor = PreProcessor::new(sample_rate);
+            preprocessor.process(&mut degraded);
+
+            match agua_core::detect(&degraded, &key, &config) {
+                Ok(r) if !r.is_empty() && r[0].payload == payload => {
+                    print!("{:<12}", format!("{:.4}", r[0].confidence));
+                }
+                Ok(_) => print!("{:<12}", "WRONG"),
+                Err(_) => print!("{:<12}", "FAIL"),
+            }
+        }
+        println!();
+    }
+}
