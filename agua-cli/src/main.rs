@@ -53,7 +53,7 @@ enum Command {
         max_freq: f32,
 
         /// Bin spacing within each frequency pair (1 = adjacent)
-        #[arg(long, default_value = "4")]
+        #[arg(long, default_value = "8")]
         bin_spacing: usize,
     },
     /// Detect a watermark in a WAV file
@@ -87,7 +87,7 @@ enum Command {
         max_freq: f32,
 
         /// Bin spacing within each frequency pair (1 = adjacent)
-        #[arg(long, default_value = "4")]
+        #[arg(long, default_value = "8")]
         bin_spacing: usize,
 
         /// Show debug diagnostics (sync correlations, soft values) on failure

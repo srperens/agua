@@ -14,9 +14,9 @@ pub struct WatermarkConfig {
     pub min_freq_hz: f32,
     /// Maximum frequency in Hz for watermark embedding. Default: 4300.0.
     pub max_freq_hz: f32,
-    /// Spacing between bins in each pair. Default: 4.
+    /// Spacing between bins in each pair. Default: 8 (~375 Hz at 48 kHz).
     /// Higher values spread pairs across wider frequency gaps, improving
-    /// resilience to comb filtering from multi-speaker playback.
+    /// resilience to acoustic channel degradation and comb filtering.
     pub bin_spacing: usize,
 }
 
@@ -29,7 +29,7 @@ impl Default for WatermarkConfig {
             num_bin_pairs: 60,
             min_freq_hz: 860.0,
             max_freq_hz: 4300.0,
-            bin_spacing: 4,
+            bin_spacing: 8,
         }
     }
 }

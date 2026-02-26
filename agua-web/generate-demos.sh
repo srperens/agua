@@ -2,22 +2,21 @@
 #
 # Generate demo WAV files for the agua web detector.
 #
-# Downloads the Sintel trailer audio from Xiph.org (Jan Morgenstern,
-# CC BY 3.0), loops it to ~3 min, converts to 48 kHz mono WAV,
-# then embeds watermarks at multiple strengths.
+# Downloads "Paradise Found" by Kevin MacLeod (CC BY 4.0) from
+# Incompetech, converts to 48 kHz mono WAV, then embeds watermarks
+# at multiple strengths.
 #
 # Each strength level gets a unique payload for easy identification.
 #
 # Requirements: curl, ffmpeg, cargo (builds agua-cli if needed)
 #
 # Source music:
-#   Sintel trailer OST — https://media.xiph.org/sintel/
-#   License: CC BY 3.0 — https://creativecommons.org/licenses/by/3.0/
-#   Credit: Jan Morgenstern
+#   "Paradise Found" — Kevin MacLeod (incompetech.com)
+#   License: CC BY 4.0 — https://creativecommons.org/licenses/by/4.0/
 #
 # Other free music sources:
+#   Incompetech full catalog (CC BY 4.0): https://incompetech.com/music/royalty-free/music.html
 #   Big Buck Bunny OST (CC BY 3.0): https://archive.org/details/JanMorgenstern-BigBuckBunny
-#   Kevin MacLeod / Incompetech (CC BY 4.0): https://incompetech.com/music/royalty-free/music.html
 #   Xiph.org test media: https://media.xiph.org/
 #   Free Music Archive: https://freemusicarchive.org/
 #
@@ -27,10 +26,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUT_DIR="$SCRIPT_DIR/static"
 SOURCE_DIR="$SCRIPT_DIR/source"
-SOURCE_FLAC="$SOURCE_DIR/sintel-trailer-audio.flac"
-SOURCE_WAV="$SOURCE_DIR/sintel-trailer-48k-mono.wav"
-SOURCE_URL="https://media.xiph.org/sintel/sintel_trailer-audio.flac"
-LOOP_DURATION=200  # ~3:20, enough for multiple detection blocks
+SOURCE_MP3="$SOURCE_DIR/Paradise_Found.mp3"
+SOURCE_WAV="$SOURCE_DIR/paradise-found-48k-mono.wav"
+SOURCE_URL="https://incompetech.com/music/royalty-free/mp3-royaltyfree/Paradise_Found.mp3"
 
 # Strengths and their payloads (last 8 hex chars encode strength)
 declare -A DEMOS=(
@@ -43,12 +41,12 @@ declare -A DEMOS=(
 # --- Download and convert source ---
 mkdir -p "$SOURCE_DIR"
 if [ ! -f "$SOURCE_WAV" ]; then
-  if [ ! -f "$SOURCE_FLAC" ]; then
-    echo "=== Downloading Sintel trailer audio (4.5 MB) ==="
-    curl -L "$SOURCE_URL" -o "$SOURCE_FLAC"
+  if [ ! -f "$SOURCE_MP3" ]; then
+    echo "=== Downloading Paradise Found by Kevin MacLeod (3.6 MB) ==="
+    curl -L "$SOURCE_URL" -o "$SOURCE_MP3"
   fi
-  echo "=== Looping to ${LOOP_DURATION}s and converting to 48 kHz mono WAV ==="
-  ffmpeg -y -stream_loop 3 -i "$SOURCE_FLAC" -t "$LOOP_DURATION" -ar 48000 -ac 1 "$SOURCE_WAV" 2>&1 | tail -1
+  echo "=== Converting to 48 kHz mono WAV ==="
+  ffmpeg -y -i "$SOURCE_MP3" -ar 48000 -ac 1 "$SOURCE_WAV" 2>&1 | tail -1
 fi
 echo "Source: $SOURCE_WAV ($(du -h "$SOURCE_WAV" | cut -f1))"
 
@@ -90,4 +88,4 @@ else
   echo "Some demos did not detect in single-pass (weak strengths may still work in streaming mode)."
 fi
 echo ""
-echo "Credit: Music by Jan Morgenstern, from Sintel (CC BY 3.0)"
+echo "Credit: \"Paradise Found\" by Kevin MacLeod (incompetech.com), CC BY 4.0"

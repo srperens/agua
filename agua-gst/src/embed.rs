@@ -47,7 +47,7 @@ mod imp {
                 num_bin_pairs: 60,
                 min_freq_hz: 860.0,
                 max_freq_hz: 4300.0,
-                bin_spacing: 4,
+                bin_spacing: 8,
                 offset_seconds: 0.0,
                 sample_rate: 48000,
                 channels: 1,
@@ -160,7 +160,7 @@ mod imp {
                         .blurb("Spacing between bins in each pair (1 = adjacent)")
                         .minimum(1)
                         .maximum(100)
-                        .default_value(4)
+                        .default_value(8)
                         .build(),
                     glib::ParamSpecFloat::builder("offset-seconds")
                         .nick("Offset seconds")
