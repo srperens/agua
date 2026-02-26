@@ -1,21 +1,13 @@
-use agua_core::{StreamDetector, WatermarkConfig, WatermarkKey};
+use agua_core::{PreProcessor, StreamDetector, WatermarkConfig, WatermarkKey};
 use wasm_bindgen::prelude::*;
 
-/// Reset the detector after this many blocks without a detection to prevent
-/// unbounded memory growth in StreamDetector's internal soft_values buffer.
-const MAX_BLOCKS_WITHOUT_DETECTION: usize = 3;
-
-/// WASM wrapper around agua-core's StreamDetector.
+/// WASM wrapper around agua-core's StreamDetector with mic preprocessing.
 #[wasm_bindgen]
 pub struct WasmDetector {
-    key: WatermarkKey,
-    config: WatermarkConfig,
+    preprocessor: PreProcessor,
     detector: StreamDetector,
-    hop_size: usize,
     last_confidence: f32,
     last_payload: Option<String>,
-    frames_since_detection: usize,
-    frames_per_block: usize,
 }
 
 #[wasm_bindgen]
@@ -29,49 +21,36 @@ impl WasmDetector {
             ..WatermarkConfig::default()
         };
 
-        let hop_size = config.hop_size();
+        let preprocessor = PreProcessor::new(sample_rate);
         let detector =
             StreamDetector::new(&wm_key, &config).map_err(|e| JsError::new(&format!("{e}")))?;
 
-        // sync (128 bits) + coded payload ((128 + 32) data bits * 6 rate = 960) = 1088
-        let frames_per_block = 128 + (128 + 32) * 6;
-
         Ok(WasmDetector {
-            key: wm_key,
-            config,
+            preprocessor,
             detector,
-            hop_size,
             last_confidence: 0.0,
             last_payload: None,
-            frames_since_detection: 0,
-            frames_per_block,
         })
     }
 
     /// Feed audio samples to the detector.
     ///
-    /// Returns the detected payload as a hex string, or null if nothing detected yet.
+    /// Applies bandpass filtering and RMS normalization (to handle mic AGC),
+    /// then feeds to the streaming detector. Returns the detected payload
+    /// as a hex string, or null if nothing detected yet.
     pub fn process(&mut self, samples: &[f32]) -> Option<String> {
-        let results = self.detector.process(samples);
+        // Preprocess: bandpass filter + RMS normalization
+        let mut buf = samples.to_vec();
+        self.preprocessor.process(&mut buf);
 
-        self.frames_since_detection += samples.len() / self.hop_size;
+        let results = self.detector.process(&buf);
 
         if let Some(result) = results.last() {
             self.last_confidence = result.confidence;
             let hex = result.payload.to_hex();
             self.last_payload = Some(hex.clone());
-            self.frames_since_detection = 0;
             Some(hex)
         } else {
-            // Reset detector periodically to prevent unbounded memory growth
-            // when no watermark is present in the audio.
-            let reset_threshold = self.frames_per_block * MAX_BLOCKS_WITHOUT_DETECTION;
-            if self.frames_since_detection >= reset_threshold {
-                if let Ok(fresh) = StreamDetector::new(&self.key, &self.config) {
-                    self.detector = fresh;
-                }
-                self.frames_since_detection = 0;
-            }
             None
         }
     }
@@ -83,11 +62,19 @@ impl WasmDetector {
 
     /// How full the detection buffer is (0.0 to 1.0).
     pub fn get_buffer_fill(&self) -> f32 {
-        (self.frames_since_detection as f32 / self.frames_per_block as f32).min(1.0)
+        self.detector.buffer_fill()
     }
 
     /// The last detected payload hex string, or null.
     pub fn get_last_payload(&self) -> Option<String> {
         self.last_payload.clone()
+    }
+
+    /// Reset the detector and preprocessor state.
+    pub fn reset(&mut self) {
+        self.preprocessor.reset();
+        self.detector.reset();
+        self.last_confidence = 0.0;
+        self.last_payload = None;
     }
 }
