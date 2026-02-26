@@ -2,7 +2,7 @@
 #
 # Generate demo WAV files for the agua web detector.
 #
-# Downloads "Paradise Found" by Kevin MacLeod (CC BY 4.0) from
+# Downloads "Equatorial Complex" by Kevin MacLeod (CC BY 4.0) from
 # Incompetech, converts to 48 kHz mono WAV, then embeds watermarks
 # at multiple strengths.
 #
@@ -11,7 +11,7 @@
 # Requirements: curl, ffmpeg, cargo (builds agua-cli if needed)
 #
 # Source music:
-#   "Paradise Found" — Kevin MacLeod (incompetech.com)
+#   "Equatorial Complex" — Kevin MacLeod (incompetech.com)
 #   License: CC BY 4.0 — https://creativecommons.org/licenses/by/4.0/
 #
 # Other free music sources:
@@ -26,9 +26,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUT_DIR="$SCRIPT_DIR/static"
 SOURCE_DIR="$SCRIPT_DIR/source"
-SOURCE_MP3="$SOURCE_DIR/Paradise_Found.mp3"
-SOURCE_WAV="$SOURCE_DIR/paradise-found-48k-mono.wav"
-SOURCE_URL="https://incompetech.com/music/royalty-free/mp3-royaltyfree/Paradise_Found.mp3"
+SOURCE_MP3="$SOURCE_DIR/Equatorial_Complex.mp3"
+SOURCE_WAV="$SOURCE_DIR/equatorial-complex-48k-mono.wav"
+SOURCE_URL="https://incompetech.com/music/royalty-free/mp3-royaltyfree/Equatorial%20Complex.mp3"
 
 # Strengths and their payloads (last 8 hex chars encode strength)
 declare -A DEMOS=(
@@ -42,7 +42,7 @@ declare -A DEMOS=(
 mkdir -p "$SOURCE_DIR"
 if [ ! -f "$SOURCE_WAV" ]; then
   if [ ! -f "$SOURCE_MP3" ]; then
-    echo "=== Downloading Paradise Found by Kevin MacLeod (3.6 MB) ==="
+    echo "=== Downloading Equatorial Complex by Kevin MacLeod ==="
     curl -L "$SOURCE_URL" -o "$SOURCE_MP3"
   fi
   echo "=== Converting to 48 kHz mono WAV ==="
@@ -88,4 +88,4 @@ else
   echo "Some demos did not detect in single-pass (weak strengths may still work in streaming mode)."
 fi
 echo ""
-echo "Credit: \"Paradise Found\" by Kevin MacLeod (incompetech.com), CC BY 4.0"
+echo "Credit: \"Equatorial Complex\" by Kevin MacLeod (incompetech.com), CC BY 4.0"
