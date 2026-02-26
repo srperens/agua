@@ -166,6 +166,23 @@ impl WasmDetector {
         self.detector.diag_sync_candidates()
     }
 
+    /// Number of blocks currently accumulated for soft combining.
+    ///
+    /// Returns 0 when idle, 1+ when accumulating across blocks.
+    pub fn get_combine_count(&self) -> u32 {
+        self.detector.combine_count()
+    }
+
+    /// Number of successful soft value extractions.
+    pub fn get_soft_extractions(&self) -> u32 {
+        self.detector.diag_soft_extractions()
+    }
+
+    /// Status of last soft combine attempt (0=not tried, 1=err, 2=none, 3=ok).
+    pub fn get_soft_combine_status(&self) -> u32 {
+        self.detector.diag_soft_combine_status()
+    }
+
     /// Reset the detector and preprocessor state.
     pub fn reset(&mut self) {
         console_log!("[wasm] reset()");

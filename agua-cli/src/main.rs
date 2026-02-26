@@ -170,10 +170,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             let frames_per_block = agua_core::sync::frames_per_block();
-            let total_frames = samples.len() / config.frame_size;
+            let hop_size = config.hop_size();
+            let total_frames = if samples.len() < config.frame_size {
+                0
+            } else {
+                (samples.len() - config.frame_size) / hop_size + 1
+            };
             let offset_samples = (offset_seconds * config.sample_rate as f32).round() as usize;
-            let offset_frames = offset_samples / config.frame_size;
-            let effective_offset = offset_frames * config.frame_size;
+            let offset_frames = offset_samples / hop_size;
+            let effective_offset = offset_frames * hop_size;
             if effective_offset >= samples.len() {
                 return Err(format!(
                     "offset_seconds too large: {}s exceeds audio length",
@@ -190,7 +195,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let num_frames = total_frames.saturating_sub(offset_frames);
             if num_frames < frames_per_block {
-                let needed_samples = frames_per_block * config.frame_size;
+                let needed_samples = (frames_per_block - 1) * hop_size + config.frame_size;
                 let needed_seconds = needed_samples as f32 / config.sample_rate as f32;
                 eprintln!(
                     "Warning: audio is too short for reliable detection ({} frames, need {}). \
@@ -284,10 +289,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             let frames_per_block = agua_core::sync::frames_per_block();
-            let total_frames = samples.len() / config.frame_size;
+            let hop_size = config.hop_size();
+            let total_frames = if samples.len() < config.frame_size {
+                0
+            } else {
+                (samples.len() - config.frame_size) / hop_size + 1
+            };
             let offset_samples = (offset_seconds * config.sample_rate as f32).round() as usize;
-            let offset_frames = offset_samples / config.frame_size;
-            let effective_offset = offset_frames * config.frame_size;
+            let offset_frames = offset_samples / hop_size;
+            let effective_offset = offset_frames * hop_size;
             if effective_offset >= samples.len() {
                 return Err(format!(
                     "offset_seconds too large: {}s exceeds audio length",
@@ -304,7 +314,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let num_frames = total_frames.saturating_sub(offset_frames);
             if num_frames < frames_per_block {
-                let needed_samples = frames_per_block * config.frame_size;
+                let needed_samples = (frames_per_block - 1) * hop_size + config.frame_size;
                 let needed_seconds = needed_samples as f32 / config.sample_rate as f32;
                 eprintln!(
                     "Warning: audio is too short for reliable detection ({} frames, need {}). \
@@ -323,7 +333,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("  Confidence: {:.4}", r.confidence);
                         println!("  Offset:     frame {}", r.offset);
                         let offset_seconds =
-                            r.offset as f32 * config.frame_size as f32 / config.sample_rate as f32;
+                            r.offset as f32 * hop_size as f32 / config.sample_rate as f32;
                         println!("  Offset:     {:.3} s", offset_seconds);
                     }
                 }
@@ -331,7 +341,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if verbose {
                         // Debug: compute best sync correlations to see if any peaks exist
                         use agua_core::{fft::FftProcessor, frame::hann_window, sync};
-                        let hop_size = config.hop_size();
                         let frame_size = config.frame_size;
                         if samples[start..].len() >= frame_size {
                             let num_frames = (samples[start..].len() - frame_size) / hop_size + 1;
@@ -347,11 +356,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     *s *= window[i];
                                 }
                                 fft.forward(&mut buf)?;
-                                let global_frame = frame_offset as usize + frame_idx;
                                 let soft = agua_core::patchwork::detect_frame(
                                     fft.freq_bins(),
                                     &wm_key,
-                                    global_frame as u32,
+                                    0,
                                     &config,
                                 );
                                 soft_values.push(soft);

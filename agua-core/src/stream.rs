@@ -1,5 +1,6 @@
 use crate::codec;
 use crate::config::WatermarkConfig;
+use crate::detect;
 use crate::embed::DetectionResult;
 use crate::fft::FftProcessor;
 use crate::frame::hann_window;
@@ -155,6 +156,15 @@ impl StreamEmbedder {
     }
 }
 
+/// Default maximum number of blocks to combine before resetting.
+const DEFAULT_MAX_COMBINE_BLOCKS: u32 = 3;
+
+/// Sync position tolerance in samples for cross-block alignment.
+/// If the new block's absolute sync position differs from the predicted
+/// position by more than this, the accumulator resets.
+/// With hop_size=512 and ±2 frames tolerance: 2 * 512 = 1024 samples.
+const SYNC_POSITION_TOLERANCE_SAMPLES: usize = 1024;
+
 /// Streaming watermark detector with sliding-window sync search.
 ///
 /// Accepts arbitrary-length input chunks and reports detected watermarks.
@@ -163,8 +173,11 @@ impl StreamEmbedder {
 /// 1. Arbitrary block boundary (sync search via sliding window)
 /// 2. Arbitrary sub-frame sample alignment (multi-offset search)
 ///
-/// This enables detection when the mic starts recording at any point
-/// in the watermarked stream (e.g. speaker → air → mic path).
+/// When single-block detection fails (low SNR), the detector accumulates
+/// soft values across consecutive blocks and tries combined Viterbi
+/// decoding. SNR improves by ~sqrt(N) where N is the number of blocks
+/// combined. This is transparent to the caller — the same `process()`
+/// API is used.
 pub struct StreamDetector {
     config: WatermarkConfig,
     key: WatermarkKey,
@@ -183,6 +196,21 @@ pub struct StreamDetector {
     diag_best_sync_corr: f32,
     /// Diagnostics: number of sync candidates above threshold in last attempt.
     diag_sync_candidates: u32,
+    /// Accumulated soft values from previous blocks (element-wise sum).
+    accumulated_soft: Option<Vec<f32>>,
+    /// Number of blocks combined in the accumulator so far.
+    combine_count: u32,
+    /// Maximum blocks to combine before resetting.
+    max_combine_blocks: u32,
+    /// Absolute sample position of the last sync detection, used to predict
+    /// next block's sync. Computed as total_samples_consumed + sync_offset * hop_size.
+    last_sync_absolute: Option<usize>,
+    /// Diagnostics: combine count from the last successful combined detection.
+    diag_last_combine_count: u32,
+    /// Diagnostics: successful soft value extractions.
+    diag_soft_extractions: u32,
+    /// Diagnostics: reason for last soft combine failure (0=not tried, 1=extract_err, 2=extract_none, 3=ok).
+    diag_soft_combine_status: u32,
 }
 
 impl StreamDetector {
@@ -194,8 +222,8 @@ impl StreamDetector {
         let hop_size = config.hop_size();
         // Samples needed to produce frames_per_block frames.
         let block_samples = (frames_per_block - 1) * hop_size + config.frame_size;
-        // Buffer up to 2 blocks to allow sync search.
-        let max_buf_samples = 2 * block_samples;
+        // Buffer enough for max_combine_blocks + 1 blocks to support combining.
+        let max_buf_samples = (DEFAULT_MAX_COMBINE_BLOCKS as usize + 1) * block_samples;
 
         Ok(Self {
             config: config.clone(),
@@ -208,6 +236,13 @@ impl StreamDetector {
             diag_detect_attempts: 0,
             diag_best_sync_corr: 0.0,
             diag_sync_candidates: 0,
+            accumulated_soft: None,
+            combine_count: 0,
+            max_combine_blocks: DEFAULT_MAX_COMBINE_BLOCKS,
+            last_sync_absolute: None,
+            diag_last_combine_count: 0,
+            diag_soft_extractions: 0,
+            diag_soft_combine_status: 0,
         })
     }
 
@@ -222,17 +257,17 @@ impl StreamDetector {
             if let Some(result) = self.try_detect_batch() {
                 results.push(result);
             } else {
-                // No detection — advance by the scan window size so the
-                // next attempt covers new frame positions. The scan window
-                // is (num_frames - frames_per_block) frames.
-                let hop_size = self.config.hop_size();
-                let num_frames =
-                    (self.audio_buf.len() - self.config.frame_size) / hop_size + 1;
-                let scanned_frames = num_frames.saturating_sub(self.frames_per_block);
-                let advance = (scanned_frames * hop_size).max(hop_size);
-                let drain = advance.min(self.audio_buf.len());
-                self.audio_buf.drain(..drain);
-                self.total_samples_consumed += drain;
+                // try_detect_batch may have already drained the buffer
+                // (soft combining path). Only drain if still above threshold.
+                if self.audio_buf.len() >= scan_threshold {
+                    let hop_size = self.config.hop_size();
+                    let num_frames = (self.audio_buf.len() - self.config.frame_size) / hop_size + 1;
+                    let scanned_frames = num_frames.saturating_sub(self.frames_per_block);
+                    let advance = (scanned_frames * hop_size).max(hop_size);
+                    let drain = advance.min(self.audio_buf.len());
+                    self.audio_buf.drain(..drain);
+                    self.total_samples_consumed += drain;
+                }
                 break;
             }
         }
@@ -247,17 +282,16 @@ impl StreamDetector {
         results
     }
 
-    /// Run one-shot detection on the audio buffer. The `detect()` function
-    /// handles both sync search and sub-frame alignment internally.
+    /// Run one-shot detection on the audio buffer, with soft combining fallback.
+    ///
+    /// First tries single-block Viterbi decode (fast path). On failure,
+    /// extracts data soft values and accumulates them across blocks.
+    /// When enough blocks are combined, tries Viterbi on the combined soft values.
     fn try_detect_batch(&mut self) -> Option<DetectionResult> {
         let hop_size = self.config.hop_size();
         self.diag_detect_attempts += 1;
 
-        // Use single-offset detection (offset 0) for speed. The streaming
-        // drain mechanism provides offset diversity over time, so we don't
-        // need the expensive multi-offset search that detect() does.
-        // This avoids 16× FFT passes and hundreds of Viterbi decodes that
-        // would freeze WASM for minutes.
+        // Fast path: try single-block detection (unchanged behavior)
         let (result, diag) = crate::detect::detect_single_offset_with_diagnostics(
             &self.audio_buf,
             &self.key,
@@ -269,12 +303,13 @@ impl StreamDetector {
         if let Ok(det_results) = result
             && let Some(result) = det_results.into_iter().next()
         {
-            // Drain buffer past the detected block
+            // Single-block success — drain, reset accumulator, report
             let block_end_frames = result.offset + self.frames_per_block;
             let block_end_samples = (block_end_frames - 1) * hop_size + self.config.frame_size;
             let drain = block_end_samples.min(self.audio_buf.len());
             self.audio_buf.drain(..drain);
             self.total_samples_consumed += drain;
+            self.reset_accumulator();
 
             return Some(DetectionResult {
                 payload: result.payload,
@@ -282,7 +317,104 @@ impl StreamDetector {
                 offset: self.total_samples_consumed,
             });
         }
+
+        // Single-block failed — try soft combining
+        self.try_soft_combine()
+    }
+
+    /// Extract soft values from the current buffer and combine with accumulated values.
+    fn try_soft_combine(&mut self) -> Option<DetectionResult> {
+        let hop_size = self.config.hop_size();
+
+        let extracted = match detect::extract_data_soft(&self.audio_buf, &self.key, &self.config) {
+            Ok(v) => v,
+            Err(_) => {
+                self.diag_soft_combine_status = 1; // extract error
+                return None;
+            }
+        };
+        let (data_soft, sync_offset, sync_corr) = match extracted {
+            Some(v) => v,
+            None => {
+                self.diag_soft_combine_status = 2; // extract returned None
+                return None;
+            }
+        };
+        self.diag_soft_extractions += 1;
+        self.diag_soft_combine_status = 3; // extraction OK
+
+        // Compute absolute sample position of this sync (before any drain)
+        let current_sync_absolute = self.total_samples_consumed + sync_offset * hop_size;
+
+        // Check sync alignment with previous block
+        if let Some(last_abs) = self.last_sync_absolute {
+            let predicted = last_abs + self.frames_per_block * hop_size;
+            let diff = current_sync_absolute.abs_diff(predicted);
+            if diff > SYNC_POSITION_TOLERANCE_SAMPLES {
+                // Alignment lost — reset and start fresh with this block
+                self.reset_accumulator();
+            }
+        }
+
+        // Accumulate soft values
+        if let Some(ref mut acc) = self.accumulated_soft {
+            // Element-wise sum
+            for (a, &s) in acc.iter_mut().zip(data_soft.iter()) {
+                *a += s;
+            }
+            self.combine_count += 1;
+        } else {
+            // First block in accumulator
+            self.accumulated_soft = Some(data_soft);
+            self.combine_count = 1;
+        }
+        self.last_sync_absolute = Some(current_sync_absolute);
+
+        // Try Viterbi on combined soft values (only after 2+ blocks)
+        if self.combine_count >= 2
+            && let Some(ref acc) = self.accumulated_soft
+            && let Some(payload) = detect::try_decode_soft(acc)
+        {
+            let confidence = sync_corr;
+            // Drain past this block
+            let block_end_frames = sync_offset + self.frames_per_block;
+            let block_end_samples = (block_end_frames - 1) * hop_size + self.config.frame_size;
+            let drain = block_end_samples.min(self.audio_buf.len());
+            self.audio_buf.drain(..drain);
+            self.total_samples_consumed += drain;
+            let combine_count = self.combine_count;
+            self.reset_accumulator();
+            self.diag_last_combine_count = combine_count;
+
+            return Some(DetectionResult {
+                payload,
+                confidence,
+                offset: self.total_samples_consumed,
+            });
+        }
+
+        // Max blocks reached without success — reset
+        if self.combine_count >= self.max_combine_blocks {
+            self.reset_accumulator();
+        }
+
+        // Drain to the START of the next block (not end of current).
+        // With 50% overlap, the last frame of this block overlaps with the
+        // first frame of the next. We must preserve that overlap so the
+        // next extraction can see the complete first frame.
+        let next_block_start = (sync_offset + self.frames_per_block) * hop_size;
+        let drain = next_block_start.min(self.audio_buf.len());
+        self.audio_buf.drain(..drain);
+        self.total_samples_consumed += drain;
+
         None
+    }
+
+    /// Reset the soft combining accumulator.
+    fn reset_accumulator(&mut self) {
+        self.accumulated_soft = None;
+        self.combine_count = 0;
+        self.last_sync_absolute = None;
     }
 
     /// Finalize detection with any remaining buffered data.
@@ -322,6 +454,38 @@ impl StreamDetector {
         self.audio_buf.len()
     }
 
+    /// Number of blocks currently combined in the soft accumulator.
+    ///
+    /// Returns 0 when no combining is in progress, or 1..=max_combine_blocks
+    /// when blocks are being accumulated.
+    pub fn combine_count(&self) -> u32 {
+        self.combine_count
+    }
+
+    /// Maximum number of blocks to combine before resetting.
+    pub fn max_combine_blocks(&self) -> u32 {
+        self.max_combine_blocks
+    }
+
+    /// Combine count from the last successful combined detection.
+    ///
+    /// Returns 0 if the last detection was single-block, or 2..=max_combine_blocks
+    /// if soft combining was used.
+    pub fn diag_last_combine_count(&self) -> u32 {
+        self.diag_last_combine_count
+    }
+
+    /// Number of successful soft value extractions.
+    pub fn diag_soft_extractions(&self) -> u32 {
+        self.diag_soft_extractions
+    }
+
+    /// Status of last soft combine attempt.
+    /// 0=not tried, 1=extract error, 2=extract None, 3=extraction OK.
+    pub fn diag_soft_combine_status(&self) -> u32 {
+        self.diag_soft_combine_status
+    }
+
     /// Reset the detector state, clearing all buffered data.
     pub fn reset(&mut self) {
         self.audio_buf.clear();
@@ -329,6 +493,10 @@ impl StreamDetector {
         self.diag_detect_attempts = 0;
         self.diag_best_sync_corr = 0.0;
         self.diag_sync_candidates = 0;
+        self.diag_last_combine_count = 0;
+        self.diag_soft_extractions = 0;
+        self.diag_soft_combine_status = 0;
+        self.reset_accumulator();
     }
 }
 
@@ -514,6 +682,103 @@ mod tests {
         assert_eq!(
             batch_results[0].payload, stream_results[0].payload,
             "batch and streaming payloads differ"
+        );
+    }
+
+    /// Test that extract_data_soft and try_decode_soft work correctly,
+    /// and that summing soft values from multiple blocks produces valid output.
+    #[test]
+    fn stream_detector_soft_combine() {
+        let config = WatermarkConfig {
+            strength: 0.05,
+            ..WatermarkConfig::default()
+        };
+        let key = WatermarkKey::new(&[42u8; 16]).unwrap();
+        let payload = Payload::new([
+            0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0x00,
+            0xEE, 0xFF,
+        ]);
+
+        // 30s = ~2.5 blocks at 48kHz
+        let watermarked = embed_test_audio(&config, &key, &payload, 30);
+
+        // Test extract_data_soft on the first block
+        let result = crate::detect::extract_data_soft(&watermarked, &key, &config)
+            .expect("extract should not error");
+        let (soft1, _sync_offset1, corr1) = result.expect("should find sync and extract soft");
+        assert_eq!(
+            soft1.len(),
+            codec::CODED_BITS,
+            "soft values should match coded bits"
+        );
+        assert!(corr1 > 0.0, "sync correlation should be positive");
+
+        // Verify try_decode_soft works on single-block soft values
+        let decoded = crate::detect::try_decode_soft(&soft1);
+        assert!(decoded.is_some(), "should decode single-block soft values");
+        assert_eq!(decoded.unwrap(), payload, "single-block payload mismatch");
+
+        // Extract soft values from a later segment (second block)
+        let hop_size = config.hop_size();
+        let frames_per_block = sync::frames_per_block();
+        let block_samples = (frames_per_block - 1) * hop_size + config.frame_size;
+        if watermarked.len() > block_samples + block_samples / 2 {
+            let second_segment = &watermarked[block_samples..];
+            if let Ok(Some((soft2, _sync_offset2, _corr2))) =
+                crate::detect::extract_data_soft(second_segment, &key, &config)
+            {
+                // Sum soft values from both blocks
+                let combined: Vec<f32> =
+                    soft1.iter().zip(soft2.iter()).map(|(a, b)| a + b).collect();
+                let combined_decoded = crate::detect::try_decode_soft(&combined);
+                assert!(combined_decoded.is_some(), "combined soft should decode");
+                assert_eq!(
+                    combined_decoded.unwrap(),
+                    payload,
+                    "combined payload mismatch"
+                );
+            }
+        }
+
+        // Test StreamDetector accessors
+        let detector = StreamDetector::new(&key, &config).unwrap();
+        assert_eq!(detector.combine_count(), 0);
+        assert_eq!(
+            detector.max_combine_blocks(),
+            super::DEFAULT_MAX_COMBINE_BLOCKS
+        );
+        assert_eq!(detector.diag_last_combine_count(), 0);
+    }
+
+    /// Test that the accumulator resets properly:
+    /// - After max_combine_blocks without success
+    /// - When sync alignment is lost
+    #[test]
+    fn stream_detector_combine_resets() {
+        let config = WatermarkConfig::default();
+        let key = WatermarkKey::new(&[42u8; 16]).unwrap();
+
+        // Feed unwatermarked audio — accumulator should reset after max_combine_blocks
+        let audio = make_test_audio(48000 * 60, config.sample_rate);
+
+        let mut detector = StreamDetector::new(&key, &config).unwrap();
+        for chunk in audio.chunks(4096) {
+            let _ = detector.process(chunk);
+        }
+
+        // Accumulator should be reset (not stuck at max)
+        assert_eq!(
+            detector.combine_count(),
+            0,
+            "accumulator should reset after max blocks"
+        );
+
+        // Buffer should still be bounded
+        assert!(
+            detector.audio_buf.len() <= detector.max_buf_samples,
+            "buffer grew unbounded: {} > {}",
+            detector.audio_buf.len(),
+            detector.max_buf_samples
         );
     }
 }

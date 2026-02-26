@@ -155,7 +155,10 @@ pub fn detect_with_diagnostics(
     samples: &[f32],
     key: &WatermarkKey,
     config: &WatermarkConfig,
-) -> (core::result::Result<Vec<DetectionResult>, Error>, DetectionDiagnostics) {
+) -> (
+    core::result::Result<Vec<DetectionResult>, Error>,
+    DetectionDiagnostics,
+) {
     let mut diag = DetectionDiagnostics {
         fast_path_tried: true,
         ..DetectionDiagnostics::default()
@@ -254,12 +257,11 @@ pub fn detect_with_diagnostics(
             let num_frames = (buf.len() - frame_size) / hop_size + 1;
             if num_frames >= frames_per_block {
                 diag.offsets_searched += 1;
-                let sync_soft = match compute_soft_values_const_seed(
-                    buf, key, config, &window, num_frames,
-                ) {
-                    Ok(s) => s,
-                    Err(e) => return (Err(e), diag),
-                };
+                let sync_soft =
+                    match compute_soft_values_const_seed(buf, key, config, &window, num_frames) {
+                        Ok(s) => s,
+                        Err(e) => return (Err(e), diag),
+                    };
 
                 let scan_end = num_frames - frames_per_block;
                 let candidates_here: Vec<(usize, f32)> = (0..=scan_end)
@@ -310,7 +312,10 @@ pub fn detect_single_offset_with_diagnostics(
     samples: &[f32],
     key: &WatermarkKey,
     config: &WatermarkConfig,
-) -> (core::result::Result<Vec<DetectionResult>, Error>, DetectionDiagnostics) {
+) -> (
+    core::result::Result<Vec<DetectionResult>, Error>,
+    DetectionDiagnostics,
+) {
     let mut diag = DetectionDiagnostics {
         fast_path_tried: true,
         offsets_searched: 1,
@@ -349,8 +354,7 @@ pub fn detect_single_offset_with_diagnostics(
     let scan_end = num_frames - frames_per_block;
     let mut candidates: Vec<(usize, f32)> = (0..=scan_end)
         .map(|start| {
-            let corr =
-                correlate_sync(&sync_soft[start..start + SYNC_PATTERN_BITS], &sync_pattern);
+            let corr = correlate_sync(&sync_soft[start..start + SYNC_PATTERN_BITS], &sync_pattern);
             (start, corr)
         })
         .filter(|&(_, corr)| corr > SYNC_THRESHOLD)
@@ -470,6 +474,83 @@ fn try_two_pass_decode(
     }
 
     Ok(None)
+}
+
+/// Extract data soft values for the best sync candidate without running Viterbi.
+///
+/// Finds the sync pattern, then computes block-position-aware data soft values
+/// for the best candidate. Returns `(data_soft, sync_frame_offset, sync_correlation)`
+/// or `None` if no sync candidate exceeds the threshold.
+///
+/// Used by `StreamDetector` for soft combining across blocks.
+pub fn extract_data_soft(
+    samples: &[f32],
+    key: &WatermarkKey,
+    config: &WatermarkConfig,
+) -> Result<Option<(Vec<f32>, usize, f32)>> {
+    let frame_size = config.frame_size;
+    if samples.len() < frame_size {
+        return Err(Error::AudioTooShort {
+            needed: frame_size,
+            got: samples.len(),
+        });
+    }
+
+    let hop_size = config.hop_size();
+    let num_frames = (samples.len() - frame_size) / hop_size + 1;
+    let sync_pattern = generate_sync_pattern(key);
+    let frames_per_block = sync::frames_per_block();
+    let coded_bits_count = codec::CODED_BITS;
+
+    if num_frames < frames_per_block {
+        return Ok(None);
+    }
+
+    let window = hann_window(frame_size);
+    let sync_soft = compute_soft_values_const_seed(samples, key, config, &window, num_frames)?;
+
+    // Find best sync candidate
+    let scan_end = num_frames - frames_per_block;
+    let mut candidates: Vec<(usize, f32)> = (0..=scan_end)
+        .map(|start| {
+            let corr = correlate_sync(&sync_soft[start..start + SYNC_PATTERN_BITS], &sync_pattern);
+            (start, corr)
+        })
+        .filter(|&(_, corr)| corr > SYNC_THRESHOLD)
+        .collect();
+
+    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(core::cmp::Ordering::Equal));
+
+    if let Some(&(start, corr)) = candidates.first() {
+        let data_frame_start = start + SYNC_PATTERN_BITS;
+        let data_frame_end = data_frame_start + coded_bits_count;
+        if data_frame_end > num_frames {
+            return Ok(None);
+        }
+
+        let data_soft = compute_data_soft_values(
+            samples,
+            key,
+            config,
+            &window,
+            data_frame_start,
+            coded_bits_count,
+        )?;
+
+        Ok(Some((data_soft, start, corr)))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Run Viterbi decode + CRC check on pre-computed soft values.
+///
+/// Returns the decoded `Payload` if successful, or `None` if Viterbi
+/// decoding fails CRC validation. Used by `StreamDetector` to decode
+/// combined soft values from multiple blocks.
+pub fn try_decode_soft(soft: &[f32]) -> Option<Payload> {
+    let decoded_bits = codec::decode(soft);
+    Payload::decode_with_crc(&decoded_bits).ok()
 }
 
 /// Compute soft values using constant seed 0 for all frames.

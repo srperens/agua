@@ -51,15 +51,13 @@ The payload is a 32-character hex string (128 bits). The key is a passphrase use
 |------|---------|-------------|
 | `-p, --payload` | | 32-char hex payload (embed only) |
 | `-k, --key` | `agua-default-key` | Key passphrase |
-| `-s, --strength` | `0.01` | Embedding strength (0.001-0.1) |
-| `--profile` | | Preset profile (`music`) |
+| `-s, --strength` | `0.1` | Embedding strength (0.001-0.1) |
 | `--offset-seconds` | `0` | Delay before embedding starts |
 | `--frame-size` | `1024` | FFT frame size (power of 2) |
-| `--num-bin-pairs` | `200` | Frequency bin pairs per frame |
-| `--min-bin` | `5` | Minimum FFT bin index |
-| `--max-bin` | `500` | Maximum FFT bin index |
-
-The `music` profile uses strength 0.05, 50 bin pairs, and max bin 300 for better robustness with lossy codecs.
+| `--num-bin-pairs` | `60` | Frequency bin pairs per frame |
+| `--min-freq` | `860.0` | Minimum frequency in Hz for embedding |
+| `--max-freq` | `4300.0` | Maximum frequency in Hz for embedding |
+| `--bin-spacing` | `8` | Bin spacing within each frequency pair |
 
 ## Rust API
 
@@ -67,7 +65,7 @@ The `music` profile uses strength 0.05, 50 bin pairs, and max bin 300 for better
 use agua_core::{embed, detect, WatermarkConfig, WatermarkKey, Payload};
 
 // Configure
-let config = WatermarkConfig::default();  // 48kHz, strength 0.01
+let config = WatermarkConfig::default();  // 48kHz, strength 0.1
 let key = WatermarkKey::from_passphrase("my-secret-key");
 let payload = Payload::from_hex("deadbeef0123456789abcdef01234567")?;
 
@@ -108,7 +106,7 @@ for chunk in input_chunks {
 ### Configuration
 
 ```rust
-// Default: strength 0.01, suitable for lossless or high-bitrate audio
+// Default: strength 0.1, suitable for lossless or high-bitrate audio
 let config = WatermarkConfig::default();
 
 // Robust: strength 0.05, tuned for MP3/AAC/Opus survival
@@ -149,7 +147,7 @@ gst-inspect-1.0 aguaembed
 gst-launch-1.0 \
   filesrc location=input.wav ! wavparse ! \
   audioconvert ! audio/x-raw,format=F32LE ! \
-  aguaembed payload=deadbeef0123456789abcdef01234567 key=my-key strength=0.01 ! \
+  aguaembed payload=deadbeef0123456789abcdef01234567 key=my-key strength=0.1 ! \
   audioconvert ! wavenc ! filesink location=output.wav
 ```
 
@@ -159,11 +157,12 @@ gst-launch-1.0 \
 |----------|------|---------|-------------|
 | `payload` | String | | 32-char hex payload |
 | `key` | String | `agua-default-key` | Key passphrase |
-| `strength` | Float | 0.01 | Embedding strength |
+| `strength` | Float | 0.1 | Embedding strength |
 | `frame-size` | UInt | 1024 | FFT frame size (power of 2) |
-| `num-bin-pairs` | UInt | 200 | Bin pairs per frame |
-| `min-bin` | UInt | 5 | Minimum FFT bin index |
-| `max-bin` | UInt | 500 | Maximum FFT bin index |
+| `num-bin-pairs` | UInt | 60 | Bin pairs per frame |
+| `min-freq` | Float | 860.0 | Minimum frequency in Hz |
+| `max-freq` | Float | 4300.0 | Maximum frequency in Hz |
+| `bin-spacing` | UInt | 8 | Bin spacing within each frequency pair |
 | `offset-seconds` | Float | 0.0 | Delay before embedding starts |
 
 Audio format: F32LE, interleaved, any sample rate and channel count.
@@ -179,6 +178,8 @@ Benchmarks on release builds (criterion):
 | Stream embed 1s (4096-sample chunks) | ~266 us | 3760x |
 | Stream detect 22s (4096-sample chunks) | ~4.7 ms | 4680x |
 
+Note: one full watermark block at 48kHz is ~11.6s of audio; longer clips improve detection margin.
+
 Run benchmarks:
 
 ```bash
@@ -190,10 +191,10 @@ cargo bench --release
 Agua uses the **patchwork algorithm** operating in the frequency domain:
 
 1. **Payload encoding**: 128-bit payload + CRC-32 (160 bits) is convolutionally encoded at rate 1/6 (960 coded bits), then interleaved with a 64-bit sync pattern
-2. **Embedding**: Audio is split into non-overlapping frames. Each frame is FFT-transformed, and pseudo-random frequency bin pairs (derived from the key via AES-128 PRNG) are scaled up or down according to the watermark bit
+2. **Embedding**: Audio is split into 50%-overlapping frames (hop = frame_size/2). Each frame is FFT-transformed, and pseudo-random frequency bin pairs (derived from the key via AES-128 PRNG) are scaled up or down according to the watermark bit
 3. **Detection**: Frames are FFT-transformed and the patchwork statistic (magnitude difference between bin pairs) yields soft bit values. A Viterbi decoder recovers the payload, verified by CRC-32
 
-Minimum audio duration for reliable detection: ~22 seconds at 48kHz.
+Minimum audio duration for one full block: ~11.6 seconds at 48kHz (20s recommended for margin).
 
 ## Development
 

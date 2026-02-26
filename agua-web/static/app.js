@@ -1,6 +1,6 @@
 
 
-const VERSION = "0.6.5";
+const VERSION = "0.8.0";
 console.log("[app.js] loaded, VERSION=" + VERSION);
 const PROCESS_INTERVAL_MS = 50;
 const MAX_SAMPLES_PER_TICK = 48000; // ~1s at 48kHz — allows catching up if backlog grows
@@ -60,6 +60,7 @@ const dbgBatch = document.getElementById("dbg-batch");
 const dbgDetectAttempts = document.getElementById("dbg-detect-attempts");
 const dbgSyncCorr = document.getElementById("dbg-sync-corr");
 const dbgSyncCandidates = document.getElementById("dbg-sync-candidates");
+const dbgCombineCount = document.getElementById("dbg-combine-count");
 const vuBar = document.getElementById("vu-bar");
 const clearLogBtn = document.getElementById("clear-log-btn");
 const recBtn = document.getElementById("rec-btn");
@@ -459,6 +460,7 @@ async function start() {
             dbgDetectAttempts.textContent = msg.detectAttempts;
             dbgSyncCorr.textContent = (msg.bestSyncCorr ?? 0).toFixed(4);
             dbgSyncCandidates.textContent = msg.syncCandidates ?? 0;
+            dbgCombineCount.textContent = msg.combineCount ?? 0;
           }
         }
         if (msg.payload) {

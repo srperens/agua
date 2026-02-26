@@ -156,8 +156,7 @@ const STRENGTHS: &[f32] = &[0.01, 0.02, 0.03, 0.05, 0.08];
 
 /// Strength values for the digital-only sweep (no codec).
 const DIGITAL_STRENGTHS: &[f32] = &[
-    0.001, 0.002, 0.003, 0.005, 0.008, 0.01, 0.015, 0.02, 0.03, 0.05, 0.08, 0.10, 0.15, 0.20,
-    0.25,
+    0.001, 0.002, 0.003, 0.005, 0.008, 0.01, 0.015, 0.02, 0.03, 0.05, 0.08, 0.10, 0.15, 0.20, 0.25,
 ];
 
 #[test]
@@ -232,8 +231,8 @@ fn parameter_sweep() {
 fn digital_strength_sweep() {
     let key = WatermarkKey::new(&[42u8; 16]).unwrap();
     let payload = Payload::new([
-        0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC,
-        0xBA, 0x98,
+        0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC, 0xBA,
+        0x98,
     ]);
 
     let sample_rate = 48000u32;
@@ -275,7 +274,12 @@ fn digital_strength_sweep() {
         let (detected, correct, confidence, sync_corr) = match result {
             Ok(ref results) if !results.is_empty() => {
                 let r = &results[0];
-                (true, r.payload == payload, r.confidence, diag.best_sync_corr)
+                (
+                    true,
+                    r.payload == payload,
+                    r.confidence,
+                    diag.best_sync_corr,
+                )
             }
             Ok(_) => (false, false, 0.0, diag.best_sync_corr),
             Err(_) => (false, false, 0.0, diag.best_sync_corr),
@@ -312,8 +316,8 @@ fn streaming_strength_sweep() {
 
     let key = WatermarkKey::new(&[42u8; 16]).unwrap();
     let payload = Payload::new([
-        0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC,
-        0xBA, 0x98,
+        0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC, 0xBA,
+        0x98,
     ]);
 
     let sample_rate = 48000u32;
@@ -428,8 +432,9 @@ fn add_white_noise(samples: &mut [f32], snr_db: f32) {
         state ^= state >> 17;
         state ^= state << 5;
         let u2 = (state as f32) / u32::MAX as f32;
-        let noise =
-            noise_std * (-2.0 * u1.max(1e-10).ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
+        let noise = noise_std
+            * (-2.0 * u1.max(1e-10).ln()).sqrt()
+            * (2.0 * std::f32::consts::PI * u2).cos();
         *s += noise;
     }
 }
@@ -463,6 +468,329 @@ fn resample_jitter(samples: &[f32], ratio: f32) -> Vec<f32> {
     output
 }
 
+/// Compare "audiowmark-style" (spacing=1, pairs=30) vs "agua-style" (spacing=8, pairs=60)
+/// across multiple acoustic degradation scenarios.
+///
+/// Run with: `cargo test spacing_comparison -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn spacing_comparison() {
+    use agua_core::PreProcessor;
+    use rayon::prelude::*;
+
+    let key = WatermarkKey::new(&[42u8; 16]).unwrap();
+    let payload = Payload::new([
+        0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC, 0xBA,
+        0x98,
+    ]);
+
+    let sample_rate = 48000u32;
+    let num_samples = sample_rate as usize * 25;
+    let strength = 0.10f32;
+
+    struct Profile {
+        name: &'static str,
+        bin_spacing: usize,
+        num_bin_pairs: usize,
+    }
+
+    let profiles = [
+        Profile {
+            name: "audiowmark-style (s=1, p=30)",
+            bin_spacing: 1,
+            num_bin_pairs: 30,
+        },
+        Profile {
+            name: "agua default     (s=8, p=60)",
+            bin_spacing: 8,
+            num_bin_pairs: 60,
+        },
+        Profile {
+            name: "hybrid           (s=4, p=60)",
+            bin_spacing: 4,
+            num_bin_pairs: 60,
+        },
+        Profile {
+            name: "wide sparse      (s=8, p=30)",
+            bin_spacing: 8,
+            num_bin_pairs: 30,
+        },
+    ];
+
+    struct Scenario {
+        name: &'static str,
+    }
+
+    let scenarios = [
+        Scenario { name: "Digital" },
+        Scenario { name: "LP 8kHz" },
+        Scenario { name: "Noise 20dB" },
+        Scenario {
+            name: "Reverb 150ms",
+        },
+        Scenario {
+            name: "Spkr/Mic EQ",
+        },
+        Scenario { name: "AGC" },
+        Scenario {
+            name: "LP+N+jitter",
+        },
+        Scenario { name: "Realistic" },
+    ];
+
+    println!();
+    println!("=== Spacing comparison (strength={:.2}) ===", strength);
+    println!();
+    print!("{:<32}", "Profile");
+    for s in &scenarios {
+        print!("{:<16}", s.name);
+    }
+    println!();
+    println!("{}", "-".repeat(32 + scenarios.len() * 16));
+
+    for profile in &profiles {
+        print!("{:<32}", profile.name);
+
+        let config = WatermarkConfig {
+            strength,
+            bin_spacing: profile.bin_spacing,
+            num_bin_pairs: profile.num_bin_pairs,
+            sample_rate,
+            ..WatermarkConfig::default()
+        };
+
+        let original = make_test_audio(num_samples, sample_rate);
+
+        let mut results: Vec<(usize, String)> = scenarios
+            .par_iter()
+            .enumerate()
+            .map(|(i, _scenario)| {
+                let mut audio = original.clone();
+                agua_core::embed(&mut audio, &payload, &key, &config).unwrap();
+
+                let degraded = match i {
+                    0 => audio,
+                    1 => lowpass_filter(&audio, sample_rate, 8000.0, 127),
+                    2 => {
+                        let mut a = audio;
+                        add_white_noise(&mut a, 20.0);
+                        a
+                    }
+                    3 => convolve(&audio, &generate_rir(sample_rate, 150, 0xABCD)),
+                    4 => {
+                        let mut a = audio;
+                        apply_speaker_mic_response(&mut a, sample_rate);
+                        a
+                    }
+                    5 => {
+                        let mut a = audio;
+                        apply_agc(&mut a, sample_rate);
+                        a
+                    }
+                    6 => {
+                        let mut d = lowpass_filter(&audio, sample_rate, 8000.0, 127);
+                        add_white_noise(&mut d, 20.0);
+                        resample_jitter(&d, 1.001)
+                    }
+                    7 => {
+                        // Realistic: reverb → EQ → AGC → noise → jitter → preprocess
+                        let mut d = convolve(&audio, &generate_rir(sample_rate, 150, 0x5678));
+                        apply_speaker_mic_response(&mut d, sample_rate);
+                        apply_agc(&mut d, sample_rate);
+                        add_white_noise(&mut d, 20.0);
+                        let mut d = resample_jitter(&d, 1.001);
+                        let mut preprocessor = PreProcessor::new(sample_rate);
+                        preprocessor.process(&mut d);
+                        d
+                    }
+                    _ => unreachable!(),
+                };
+
+                let cell = match agua_core::detect(&degraded, &key, &config) {
+                    Ok(r) if !r.is_empty() && r[0].payload == payload => {
+                        format!("{:.4}", r[0].confidence)
+                    }
+                    Ok(_) => "WRONG".to_string(),
+                    Err(_) => "FAIL".to_string(),
+                };
+                (i, cell)
+            })
+            .collect();
+
+        results.sort_by_key(|(i, _)| *i);
+        for (_, cell) in results {
+            print!("{:<16}", cell);
+        }
+        println!();
+    }
+}
+
+// ── Room / speaker / mic / AGC simulation helpers ──
+
+fn xorshift32(state: &mut u32) -> u32 {
+    *state ^= *state << 13;
+    *state ^= *state >> 17;
+    *state ^= *state << 5;
+    *state
+}
+
+fn generate_rir(sample_rate: u32, rt60_ms: u32, seed: u32) -> Vec<f32> {
+    let sr = sample_rate as f32;
+    let rt60_samples = (rt60_ms as f32 / 1000.0 * sr) as usize;
+    let len = rt60_samples.max(1);
+    let mut rir = vec![0.0f32; len];
+    rir[0] = 1.0;
+    let mut rng = seed;
+    for _ in 0..6 {
+        let delay_ms = 5.0 + (xorshift32(&mut rng) as f32 / u32::MAX as f32) * 45.0;
+        let delay_samples = (delay_ms / 1000.0 * sr) as usize;
+        if delay_samples < len {
+            let amp = 0.05 + (xorshift32(&mut rng) as f32 / u32::MAX as f32) * 0.15;
+            let sign = if xorshift32(&mut rng) & 1 == 0 {
+                1.0
+            } else {
+                -1.0
+            };
+            rir[delay_samples] += sign * amp;
+        }
+    }
+    let decay_rate = -6.91 / rt60_samples as f32;
+    for (i, sample) in rir.iter_mut().enumerate().skip(1) {
+        let envelope = (decay_rate * i as f32).exp();
+        let noise = (xorshift32(&mut rng) as f32 / u32::MAX as f32) * 2.0 - 1.0;
+        *sample += noise * envelope * 0.01;
+    }
+    let peak = rir.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+    if peak > 0.0 {
+        for s in rir.iter_mut() {
+            *s /= peak;
+        }
+    }
+    rir
+}
+
+fn convolve(signal: &[f32], kernel: &[f32]) -> Vec<f32> {
+    let n = signal.len();
+    let mut output = vec![0.0f32; n];
+    for (i, out) in output.iter_mut().enumerate() {
+        let mut acc = 0.0f32;
+        for (j, &k) in kernel.iter().enumerate() {
+            if i >= j {
+                acc += signal[i - j] * k;
+            }
+        }
+        *out = acc;
+    }
+    output
+}
+
+struct SimBiquad {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    x1: f32,
+    x2: f32,
+    y1: f32,
+    y2: f32,
+}
+
+impl SimBiquad {
+    fn highpass(sample_rate: f32, cutoff: f32) -> Self {
+        let w0 = 2.0 * std::f32::consts::PI * cutoff / sample_rate;
+        let (cos_w0, sin_w0) = (w0.cos(), w0.sin());
+        let alpha = sin_w0 / (2.0_f32.sqrt());
+        let a0 = 1.0 + alpha;
+        Self {
+            b0: ((1.0 + cos_w0) / 2.0) / a0,
+            b1: (-(1.0 + cos_w0)) / a0,
+            b2: ((1.0 + cos_w0) / 2.0) / a0,
+            a1: (-2.0 * cos_w0) / a0,
+            a2: (1.0 - alpha) / a0,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+        }
+    }
+
+    fn lowpass(sample_rate: f32, cutoff: f32) -> Self {
+        let w0 = 2.0 * std::f32::consts::PI * cutoff / sample_rate;
+        let (cos_w0, sin_w0) = (w0.cos(), w0.sin());
+        let alpha = sin_w0 / (2.0_f32.sqrt());
+        let a0 = 1.0 + alpha;
+        Self {
+            b0: ((1.0 - cos_w0) / 2.0) / a0,
+            b1: (1.0 - cos_w0) / a0,
+            b2: ((1.0 - cos_w0) / 2.0) / a0,
+            a1: (-2.0 * cos_w0) / a0,
+            a2: (1.0 - alpha) / a0,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+        }
+    }
+
+    fn peaking_eq(sample_rate: f32, center_hz: f32, q: f32, gain_db: f32) -> Self {
+        let a = 10.0f32.powf(gain_db / 40.0);
+        let w0 = 2.0 * std::f32::consts::PI * center_hz / sample_rate;
+        let (cos_w0, sin_w0) = (w0.cos(), w0.sin());
+        let alpha = sin_w0 / (2.0 * q);
+        let a0 = 1.0 + alpha / a;
+        Self {
+            b0: (1.0 + alpha * a) / a0,
+            b1: (-2.0 * cos_w0) / a0,
+            b2: (1.0 - alpha * a) / a0,
+            a1: (-2.0 * cos_w0) / a0,
+            a2: (1.0 - alpha / a) / a0,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+        }
+    }
+
+    fn process(&mut self, samples: &mut [f32]) {
+        for s in samples.iter_mut() {
+            let y = self.b0 * *s + self.b1 * self.x1 + self.b2 * self.x2
+                - self.a1 * self.y1
+                - self.a2 * self.y2;
+            self.x2 = self.x1;
+            self.x1 = *s;
+            self.y2 = self.y1;
+            self.y1 = y;
+            *s = y;
+        }
+    }
+}
+
+fn apply_speaker_mic_response(samples: &mut [f32], sample_rate: u32) {
+    let sr = sample_rate as f32;
+    SimBiquad::highpass(sr, 150.0).process(samples);
+    SimBiquad::peaking_eq(sr, 2500.0, 2.0, 6.0).process(samples);
+    SimBiquad::lowpass(sr, 12000.0).process(samples);
+}
+
+fn apply_agc(samples: &mut [f32], sample_rate: u32) {
+    let sr = sample_rate as f32;
+    let attack_coeff = 1.0 - (-1.0 / (0.01 * sr)).exp();
+    let release_coeff = 1.0 - (-1.0 / (0.2 * sr)).exp();
+    let target = 0.1f32;
+    let mut envelope = target;
+    for s in samples.iter_mut() {
+        let abs_s = s.abs();
+        let coeff = if abs_s > envelope {
+            attack_coeff
+        } else {
+            release_coeff
+        };
+        envelope += coeff * (abs_s - envelope);
+        *s *= (target / envelope.max(1e-6)).clamp(0.1, 20.0);
+    }
+}
+
 /// Sweep bin_spacing × strength, both digital and through simulated acoustic channel.
 ///
 /// Run with: `cargo test bin_spacing_sweep -- --ignored --nocapture`
@@ -470,11 +798,12 @@ fn resample_jitter(samples: &[f32], ratio: f32) -> Vec<f32> {
 #[ignore]
 fn bin_spacing_sweep() {
     use agua_core::PreProcessor;
+    use rayon::prelude::*;
 
     let key = WatermarkKey::new(&[42u8; 16]).unwrap();
     let payload = Payload::new([
-        0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC,
-        0xBA, 0x98,
+        0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC, 0xBA,
+        0x98,
     ]);
 
     let sample_rate = 48000u32;
@@ -492,9 +821,14 @@ fn bin_spacing_sweep() {
     println!();
     println!("{}", "-".repeat(10 + strengths.len() * 12));
 
-    for &spacing in spacings {
-        print!("{:<10}", spacing);
-        for &strength in strengths {
+    let strengths_len = strengths.len();
+    let spacings_len = spacings.len();
+    let total_cells = spacings_len * strengths_len;
+    let results: Vec<(usize, String)> = (0..total_cells)
+        .into_par_iter()
+        .map(|idx| {
+            let spacing = spacings[idx / strengths_len];
+            let strength = strengths[idx % strengths_len];
             let config = WatermarkConfig {
                 strength,
                 bin_spacing: spacing,
@@ -505,13 +839,28 @@ fn bin_spacing_sweep() {
             let mut audio = make_test_audio(num_samples, sample_rate);
             agua_core::embed(&mut audio, &payload, &key, &config).unwrap();
 
-            match agua_core::detect(&audio, &key, &config) {
+            let cell = match agua_core::detect(&audio, &key, &config) {
                 Ok(r) if !r.is_empty() && r[0].payload == payload => {
-                    print!("{:<12}", format!("{:.4}", r[0].confidence));
+                    format!("{:.4}", r[0].confidence)
                 }
-                Ok(_) => print!("{:<12}", "WRONG"),
-                Err(_) => print!("{:<12}", "FAIL"),
-            }
+                Ok(_) => "WRONG".to_string(),
+                Err(_) => "FAIL".to_string(),
+            };
+
+            (idx, cell)
+        })
+        .collect();
+
+    let mut cells = vec![String::new(); total_cells];
+    for (idx, cell) in results {
+        cells[idx] = cell;
+    }
+
+    for (row, &spacing) in spacings.iter().enumerate() {
+        print!("{:<10}", spacing);
+        let start = row * strengths_len;
+        for col in 0..strengths_len {
+            print!("{:<12}", cells[start + col]);
         }
         println!();
     }
@@ -526,9 +875,11 @@ fn bin_spacing_sweep() {
     println!();
     println!("{}", "-".repeat(10 + strengths.len() * 12));
 
-    for &spacing in spacings {
-        print!("{:<10}", spacing);
-        for &strength in strengths {
+    let results: Vec<(usize, String)> = (0..total_cells)
+        .into_par_iter()
+        .map(|idx| {
+            let spacing = spacings[idx / strengths_len];
+            let strength = strengths[idx % strengths_len];
             let config = WatermarkConfig {
                 strength,
                 bin_spacing: spacing,
@@ -546,13 +897,28 @@ fn bin_spacing_sweep() {
             let mut preprocessor = PreProcessor::new(sample_rate);
             preprocessor.process(&mut degraded);
 
-            match agua_core::detect(&degraded, &key, &config) {
+            let cell = match agua_core::detect(&degraded, &key, &config) {
                 Ok(r) if !r.is_empty() && r[0].payload == payload => {
-                    print!("{:<12}", format!("{:.4}", r[0].confidence));
+                    format!("{:.4}", r[0].confidence)
                 }
-                Ok(_) => print!("{:<12}", "WRONG"),
-                Err(_) => print!("{:<12}", "FAIL"),
-            }
+                Ok(_) => "WRONG".to_string(),
+                Err(_) => "FAIL".to_string(),
+            };
+
+            (idx, cell)
+        })
+        .collect();
+
+    let mut cells = vec![String::new(); total_cells];
+    for (idx, cell) in results {
+        cells[idx] = cell;
+    }
+
+    for (row, &spacing) in spacings.iter().enumerate() {
+        print!("{:<10}", spacing);
+        let start = row * strengths_len;
+        for col in 0..strengths_len {
+            print!("{:<12}", cells[start + col]);
         }
         println!();
     }

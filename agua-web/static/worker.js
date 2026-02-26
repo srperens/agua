@@ -1,4 +1,4 @@
-const WORKER_VERSION = "0.6.5";
+const WORKER_VERSION = "0.8.0";
 console.log("[worker.js] loaded, VERSION=" + WORKER_VERSION);
 
 let wasmInit = null;
@@ -46,15 +46,18 @@ self.onmessage = async (event) => {
     const bestSyncCorr = typeof detector.get_best_sync_corr === "function" ? detector.get_best_sync_corr() : 0;
     const detectAttempts = typeof detector.get_detect_attempts === "function" ? detector.get_detect_attempts() : 0;
     const syncCandidates = typeof detector.get_sync_candidates === "function" ? detector.get_sync_candidates() : 0;
+    const combineCount = typeof detector.get_combine_count === "function" ? detector.get_combine_count() : 0;
+    const softExtractions = typeof detector.get_soft_extractions === "function" ? detector.get_soft_extractions() : -1;
+    const softStatus = typeof detector.get_soft_combine_status === "function" ? detector.get_soft_combine_status() : -1;
 
     if (batchCount % 50 === 0) {
-      console.log("[worker] batch=" + batchCount + " total=" + processedTotal + " fill=" + bufferFill.toFixed(3) + " syncCorr=" + bestSyncCorr.toFixed(4) + " candidates=" + syncCandidates + " attempts=" + detectAttempts);
+      console.log("[worker] batch=" + batchCount + " total=" + processedTotal + " fill=" + bufferFill.toFixed(3) + " syncCorr=" + bestSyncCorr.toFixed(4) + " candidates=" + syncCandidates + " attempts=" + detectAttempts + " combined=" + combineCount + " softOK=" + softExtractions + " softSt=" + softStatus);
     }
     if (payload) {
-      console.log("[worker] DETECTED: payload=" + payload + " confidence=" + confidence.toFixed(4));
+      console.log("[worker] DETECTED: payload=" + payload + " confidence=" + confidence.toFixed(4) + " combined=" + combineCount);
       self.postMessage({
         type: "info",
-        message: `DETECTED: payload=${payload} confidence=${confidence.toFixed(4)}`,
+        message: `DETECTED: payload=${payload} confidence=${confidence.toFixed(4)} combined=${combineCount}`,
       });
     }
     self.postMessage({
@@ -66,6 +69,7 @@ self.onmessage = async (event) => {
       bestSyncCorr,
       detectAttempts,
       syncCandidates,
+      combineCount,
     });
   }
 };
