@@ -53,4 +53,4 @@ Options:
 
 ## Configuration
 
-The "key passphrase" must match the key used when embedding the watermark. The default is `agua-demo`.
+The "key passphrase" must match the key used when embedding the watermark. The default is `agua-default-key`.
