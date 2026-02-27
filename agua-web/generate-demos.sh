@@ -30,12 +30,19 @@ SOURCE_MP3="$SOURCE_DIR/Equatorial_Complex.mp3"
 SOURCE_WAV="$SOURCE_DIR/equatorial-complex-48k-mono.wav"
 SOURCE_URL="https://incompetech.com/music/royalty-free/mp3-royaltyfree/Equatorial%20Complex.mp3"
 
+# Keys for dual watermarking
+KEY1="agua-default-key"
+KEY2="agua-default-key2"
+
 # Strengths and their payloads (last 8 hex chars encode strength)
+# Each file gets two watermarks with different keys:
+#   Key 1: full payload (deadbeef... + strength tag)
+#   Key 2: strength tag + zeros
 declare -A DEMOS=(
-  ["demo-s007.wav"]="0.07 deadbeef0123456789abcdef00070707"
-  ["demo-s008.wav"]="0.08 deadbeef0123456789abcdef00080808"
-  ["demo-s010.wav"]="0.10 deadbeef0123456789abcdef00101010"
-  ["demo-s015.wav"]="0.15 deadbeef0123456789abcdef00151515"
+  ["demo-s007.wav"]="0.07 deadbeef0123456789abcdef00070707 00070000000000000000000000000000"
+  ["demo-s008.wav"]="0.08 deadbeef0123456789abcdef00080808 00080000000000000000000000000000"
+  ["demo-s010.wav"]="0.10 deadbeef0123456789abcdef00101010 00100000000000000000000000000000"
+  ["demo-s015.wav"]="0.15 deadbeef0123456789abcdef00151515 00150000000000000000000000000000"
 )
 
 # --- Download and convert source ---
@@ -55,16 +62,27 @@ echo "=== Building agua CLI ==="
 cargo build -p agua-cli --release --manifest-path "$REPO_DIR/Cargo.toml" 2>&1 | tail -3
 AGUA="$REPO_DIR/target/release/agua"
 
-# --- Embed demos ---
+# --- Embed demos (dual watermark: two keys, two payloads) ---
 echo "=== Embedding demos ==="
 for file in "${!DEMOS[@]}"; do
-  read -r strength payload <<< "${DEMOS[$file]}"
-  echo "  $file  strength=$strength  payload=$payload"
+  read -r strength payload1 payload2 <<< "${DEMOS[$file]}"
+  echo "  $file  strength=$strength"
+  echo "    key1=$KEY1  payload=$payload1"
+  echo "    key2=$KEY2  payload=$payload2"
+  # First watermark
   "$AGUA" embed \
     -i "$SOURCE_WAV" \
     -o "$OUT_DIR/$file" \
     -s "$strength" \
-    -p "$payload"
+    -k "$KEY1" \
+    -p "$payload1"
+  # Second watermark on top of first
+  "$AGUA" embed \
+    -i "$OUT_DIR/$file" \
+    -o "$OUT_DIR/$file" \
+    -s "$strength" \
+    -k "$KEY2" \
+    -p "$payload2"
 done
 
 # --- Verify ---
@@ -72,18 +90,26 @@ echo ""
 echo "=== Verifying detection ==="
 all_ok=true
 for file in "${!DEMOS[@]}"; do
-  read -r strength payload <<< "${DEMOS[$file]}"
-  if "$AGUA" detect -i "$OUT_DIR/$file" 2>&1 | grep -q "$payload"; then
-    echo "  $file  OK"
+  read -r strength payload1 payload2 <<< "${DEMOS[$file]}"
+  # Verify key 1
+  if "$AGUA" detect -i "$OUT_DIR/$file" -k "$KEY1" 2>&1 | grep -q "$payload1"; then
+    echo "  $file  key1 OK"
   else
-    echo "  $file  FAILED (may still work via streaming/acoustic)"
+    echo "  $file  key1 FAILED (may still work via streaming/acoustic)"
+    all_ok=false
+  fi
+  # Verify key 2
+  if "$AGUA" detect -i "$OUT_DIR/$file" -k "$KEY2" 2>&1 | grep -q "$payload2"; then
+    echo "  $file  key2 OK"
+  else
+    echo "  $file  key2 FAILED (may still work via streaming/acoustic)"
     all_ok=false
   fi
 done
 
 echo ""
 if $all_ok; then
-  echo "All demos generated and verified."
+  echo "All demos generated and verified (both keys)."
 else
   echo "Some demos did not detect in single-pass (weak strengths may still work in streaming mode)."
 fi
