@@ -1,4 +1,4 @@
-const WORKER_VERSION = "0.2.0";
+const WORKER_VERSION = "0.2.1";
 console.log("[worker.js] loaded, VERSION=" + WORKER_VERSION);
 
 let wasmInit = null;
