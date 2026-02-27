@@ -159,11 +159,15 @@ impl StreamEmbedder {
 /// Default maximum number of blocks to combine before resetting.
 const DEFAULT_MAX_COMBINE_BLOCKS: u32 = 5;
 
+/// Number of sub-sample offsets to try during single-block detection.
+/// Matches the coarse search divisor used by the one-shot `detect()`.
+/// With hop_size=512, step = 512/16 = 32 samples.
+const DETECT_SUB_FRAME_STEPS: usize = 16;
+
 /// Number of sub-frame offsets to try when searching for the best
 /// frame grid alignment during the first block of a combining cycle.
-/// With hop_size=512, step = 512/8 = 64 samples.
-const COMBINE_SUB_FRAME_STEPS: usize = 8;
-
+/// With hop_size=512, step = 512/16 = 32 samples.
+const COMBINE_SUB_FRAME_STEPS: usize = 16;
 
 /// Streaming watermark detector with sliding-window sync search.
 ///
@@ -284,31 +288,58 @@ impl StreamDetector {
 
     /// Run one-shot detection on the audio buffer, with soft combining fallback.
     ///
-    /// First tries single-block Viterbi decode (fast path). On failure,
-    /// extracts data soft values and accumulates them across blocks.
-    /// When enough blocks are combined, tries Viterbi on the combined soft values.
+    /// Uses multi-offset search: first finds the best sub-sample alignment
+    /// across 16 offsets using cheap sync-only search, then runs Viterbi
+    /// only at the best offset. This handles the common acoustic scenario
+    /// where the detector's sample clock is offset from the embedder's.
+    ///
+    /// On failure, falls back to soft combining across blocks.
     fn try_detect_batch(&mut self) -> Option<DetectionResult> {
         let hop_size = self.config.hop_size();
         self.diag_detect_attempts += 1;
 
-        // Fast path: try single-block detection (unchanged behavior)
+        // Phase 1: find the best sub-sample alignment using sync-only search.
+        // This is cheap (no Viterbi) — just FFT + sync correlation at each offset.
+        let coarse_step = (hop_size / DETECT_SUB_FRAME_STEPS).max(1);
+        let mut best_offset = 0usize;
+        let mut best_corr = f32::NEG_INFINITY;
+
+        for i in 0..DETECT_SUB_FRAME_STEPS {
+            let sample_offset = i * coarse_step;
+            if sample_offset + self.config.frame_size > self.audio_buf.len() {
+                break;
+            }
+            if let Ok(Some((_frame, corr))) = detect::find_best_sync(
+                &self.audio_buf[sample_offset..],
+                &self.key,
+                &self.config,
+            ) && corr > best_corr
+            {
+                best_corr = corr;
+                best_offset = sample_offset;
+            }
+        }
+
+        self.diag_best_sync_corr = best_corr;
+
+        // Phase 2: run full detection at the best offset (includes Viterbi).
         let (result, diag) = crate::detect::detect_single_offset_with_diagnostics(
-            &self.audio_buf,
+            &self.audio_buf[best_offset..],
             &self.key,
             &self.config,
         );
-        self.diag_best_sync_corr = diag.best_sync_corr;
+        if diag.best_sync_corr > self.diag_best_sync_corr {
+            self.diag_best_sync_corr = diag.best_sync_corr;
+        }
         self.diag_sync_candidates = diag.sync_candidates;
 
         if let Ok(det_results) = result
             && let Some(result) = det_results.into_iter().next()
         {
-            // Single-block success — drain to start of NEXT block, reset, report.
-            // Using (offset + frames_per_block) * hop puts us exactly at the
-            // next block boundary. The old formula drained to the end of the
-            // last frame, which overshoots by hop_size (512 samples) and loses
-            // frame 0 of the next block, forcing a ~23s gap between detections.
-            let next_block_start = (result.offset + self.frames_per_block) * hop_size;
+            // Single-block success at sub-sample offset.
+            // Drain includes the sample offset to maintain alignment.
+            let next_block_start =
+                best_offset + (result.offset + self.frames_per_block) * hop_size;
             let drain = next_block_start.min(self.audio_buf.len());
             self.audio_buf.drain(..drain);
             self.total_samples_consumed += drain;
@@ -346,14 +377,22 @@ impl StreamDetector {
     /// Minimum audio needed before attempting detection.
     ///
     /// When combining is in progress and we know the exact block position,
-    /// one block suffices. Otherwise we need extra margin for sync search.
+    /// one block suffices. Otherwise we need two full blocks so the sync
+    /// search covers all possible block boundary positions.
+    ///
+    /// With only 1.25 blocks, `scan_end ≈ 0.25 × frames_per_block`, which
+    /// means sync is only found if the capture happened to start within the
+    /// first 25% of a block period. With 2 blocks, `scan_end ≈ frames_per_block`,
+    /// covering the entire block period regardless of start position.
     fn scan_threshold(&self) -> usize {
         if self.last_sync_absolute.is_some() {
             // Subsequent combining block: extract at predicted frame 0
             self.block_samples
         } else {
-            // Sync search needs scan margin (0.25 blocks extra)
-            self.block_samples + self.block_samples / 4
+            // Need 2 blocks so scan_end covers the full block period.
+            // This guarantees finding sync regardless of where in the
+            // watermark block cycle the capture started.
+            2 * self.block_samples
         }
     }
 
@@ -1052,6 +1091,116 @@ mod tests {
                 "large buffer found significantly fewer results ({}) than small chunks ({})",
                 all_results.len(),
                 small_chunk_results.len(),
+            );
+        }
+    }
+
+    /// Test detection when capture starts mid-stream (random block offset).
+    ///
+    /// This simulates the real scenario where a mic starts capturing a
+    /// watermarked stream that is already playing. The capture starts at
+    /// a random position within a watermark block, so the detector must
+    /// scan all possible sync positions. Requires scan_end >= frames_per_block.
+    #[test]
+    fn stream_detector_mid_stream_start() {
+        let config = WatermarkConfig {
+            strength: 0.05,
+            ..WatermarkConfig::default()
+        };
+        let key = WatermarkKey::new(&[42u8; 16]).unwrap();
+        let payload = Payload::new([
+            0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC,
+            0xBA, 0x98,
+        ]);
+
+        // 60s audio = ~5 blocks
+        let watermarked = embed_test_audio(&config, &key, &payload, 60);
+
+        // Try multiple mid-block starting offsets covering the full block period.
+        // Use frame positions at 25%, 50%, 75% into the block — these are
+        // the positions that fail with the old 1.25x scan threshold.
+        let hop_size = config.hop_size();
+        let frames_per_block = sync::frames_per_block();
+        let offsets = [
+            frames_per_block / 4,     // 25% into block
+            frames_per_block / 2,     // 50% into block
+            3 * frames_per_block / 4, // 75% into block
+        ];
+
+        for &frame_offset in &offsets {
+            let sample_offset = frame_offset * hop_size;
+            if sample_offset >= watermarked.len() {
+                continue;
+            }
+            let audio = &watermarked[sample_offset..];
+
+            let mut detector = StreamDetector::new(&key, &config).unwrap();
+            let mut results = Vec::new();
+            for chunk in audio.chunks(4096) {
+                results.extend(detector.process(chunk));
+            }
+            if let Some(r) = detector.finalize() {
+                results.push(r);
+            }
+
+            assert!(
+                !results.is_empty(),
+                "failed to detect at frame_offset={} ({}% into block)",
+                frame_offset,
+                frame_offset * 100 / frames_per_block,
+            );
+            assert_eq!(
+                results[0].payload, payload,
+                "payload mismatch at frame_offset={}",
+                frame_offset,
+            );
+        }
+    }
+
+    /// Test detection with sub-sample misalignment.
+    ///
+    /// Simulates the acoustic scenario where the mic's ADC clock is not
+    /// aligned with the speaker's DAC clock, causing a fractional-frame
+    /// sample offset. The multi-offset search should handle this.
+    #[test]
+    fn stream_detector_sub_sample_offset() {
+        let config = WatermarkConfig {
+            strength: 0.05,
+            ..WatermarkConfig::default()
+        };
+        let key = WatermarkKey::new(&[42u8; 16]).unwrap();
+        let payload = Payload::new([
+            0xCA, 0xFE, 0xBA, 0xBE, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x11, 0x22,
+            0x33, 0x44,
+        ]);
+
+        let watermarked = embed_test_audio(&config, &key, &payload, 30);
+
+        // Try various sub-sample offsets (not multiples of hop_size)
+        for &sample_offset in &[0, 100, 200, 256, 300, 400, 500] {
+            if sample_offset >= watermarked.len() {
+                continue;
+            }
+            let audio = &watermarked[sample_offset..];
+
+            let mut detector = StreamDetector::new(&key, &config).unwrap();
+            let mut results = Vec::new();
+            for chunk in audio.chunks(4096) {
+                results.extend(detector.process(chunk));
+            }
+            if let Some(r) = detector.finalize() {
+                results.push(r);
+            }
+
+            assert!(
+                !results.is_empty(),
+                "failed to detect at sample_offset={}",
+                sample_offset,
+            );
+            assert_eq!(
+                results[0].payload, payload,
+                "payload mismatch at sample_offset={}",
+                sample_offset,
             );
         }
     }
