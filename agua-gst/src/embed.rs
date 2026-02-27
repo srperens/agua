@@ -196,7 +196,7 @@ mod imp {
                     settings.max_freq_hz = value.get::<f32>().unwrap_or(4300.0);
                 }
                 "bin-spacing" => {
-                    settings.bin_spacing = value.get::<u32>().unwrap_or(1).max(1) as usize;
+                    settings.bin_spacing = value.get::<u32>().unwrap_or(8).max(1) as usize;
                 }
                 "offset-seconds" => {
                     settings.offset_seconds = value.get::<f32>().unwrap_or(0.0);
