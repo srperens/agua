@@ -14,7 +14,7 @@ cd "$STATIC_DIR"
 
 python3 -c "
 import http.server, ssl
-server = http.server.HTTPServer(('0.0.0.0', 8080), http.server.SimpleHTTPRequestHandler)
+server = http.server.ThreadingHTTPServer(('0.0.0.0', 8080), http.server.SimpleHTTPRequestHandler)
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain('$CERT_DIR/mkcert.pem', '$CERT_DIR/mkcert-key.pem')
 server.socket = ctx.wrap_socket(server.socket, server_side=True)
