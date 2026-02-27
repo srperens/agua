@@ -488,6 +488,35 @@ pub fn extract_data_soft(
     key: &WatermarkKey,
     config: &WatermarkConfig,
 ) -> Result<Option<(Vec<f32>, usize, f32)>> {
+    extract_data_soft_near(samples, key, config, None)
+}
+
+/// Maximum frame distance for preferring a predicted-position candidate.
+///
+/// When a `preferred_frame` hint is given, candidates within this range
+/// are preferred over the highest-correlation candidate. This accommodates
+/// sync position jitter in acoustic scenarios where noise shifts the
+/// best-correlation candidate between blocks.
+const PREFER_RANGE_FRAMES: usize = 20;
+
+/// Extract data soft values, optionally preferring a sync candidate near a
+/// predicted frame offset.
+///
+/// When `preferred_frame` is `Some(offset)`, selects the candidate closest
+/// to `offset` (within [`PREFER_RANGE_FRAMES`]) instead of the one with
+/// highest correlation. Falls back to the best-correlation candidate if
+/// no candidate is near the predicted position.
+///
+/// This is critical for soft combining across blocks in acoustic scenarios:
+/// noise causes the highest-correlation candidate to jump between blocks,
+/// breaking alignment. Using a position hint keeps consecutive extractions
+/// aligned to the same watermark block boundary.
+pub fn extract_data_soft_near(
+    samples: &[f32],
+    key: &WatermarkKey,
+    config: &WatermarkConfig,
+    preferred_frame: Option<usize>,
+) -> Result<Option<(Vec<f32>, usize, f32)>> {
     let frame_size = config.frame_size;
     if samples.len() < frame_size {
         return Err(Error::AudioTooShort {
@@ -509,7 +538,7 @@ pub fn extract_data_soft(
     let window = hann_window(frame_size);
     let sync_soft = compute_soft_values_const_seed(samples, key, config, &window, num_frames)?;
 
-    // Find best sync candidate
+    // Find sync candidates above threshold
     let scan_end = num_frames - frames_per_block;
     let mut candidates: Vec<(usize, f32)> = (0..=scan_end)
         .map(|start| {
@@ -521,7 +550,21 @@ pub fn extract_data_soft(
 
     candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(core::cmp::Ordering::Equal));
 
-    if let Some(&(start, corr)) = candidates.first() {
+    // Select candidate: prefer one near predicted position if hint given
+    let selected = if let Some(preferred) = preferred_frame {
+        // Find closest candidate within PREFER_RANGE_FRAMES of predicted position
+        let near = candidates
+            .iter()
+            .filter(|&&(start, _)| start.abs_diff(preferred) <= PREFER_RANGE_FRAMES)
+            .min_by_key(|&&(start, _)| start.abs_diff(preferred))
+            .copied();
+        // Fall back to highest-correlation candidate
+        near.or_else(|| candidates.first().copied())
+    } else {
+        candidates.first().copied()
+    };
+
+    if let Some((start, corr)) = selected {
         let data_frame_start = start + SYNC_PATTERN_BITS;
         let data_frame_end = data_frame_start + coded_bits_count;
         if data_frame_end > num_frames {
@@ -541,6 +584,113 @@ pub fn extract_data_soft(
     } else {
         Ok(None)
     }
+}
+
+/// Extract data soft values at a known sync frame position.
+///
+/// Unlike [`extract_data_soft`], this does **not** search for the sync pattern.
+/// The caller specifies the exact sync frame offset (e.g., from a predicted
+/// position based on a previous block). Returns `(data_soft, sync_correlation)`
+/// if the position is valid, or `None` if there aren't enough frames.
+///
+/// Used by `StreamDetector` for combining blocks 2+: the sync position is
+/// predicted from block 1, so the data extraction is always frame-aligned
+/// with the first block's extraction.
+pub fn extract_data_soft_at(
+    samples: &[f32],
+    key: &WatermarkKey,
+    config: &WatermarkConfig,
+    sync_frame_offset: usize,
+) -> Result<Option<(Vec<f32>, f32)>> {
+    let frame_size = config.frame_size;
+    if samples.len() < frame_size {
+        return Err(Error::AudioTooShort {
+            needed: frame_size,
+            got: samples.len(),
+        });
+    }
+
+    let hop_size = config.hop_size();
+    let num_frames = (samples.len() - frame_size) / hop_size + 1;
+    let coded_bits_count = codec::CODED_BITS;
+
+    let data_frame_start = sync_frame_offset + SYNC_PATTERN_BITS;
+    let data_frame_end = data_frame_start + coded_bits_count;
+    if data_frame_end > num_frames {
+        return Ok(None);
+    }
+
+    let window = hann_window(frame_size);
+
+    // Compute sync correlation at the given position as a quality check
+    let sync_pattern = generate_sync_pattern(key);
+    let sync_soft =
+        compute_soft_values_const_seed(samples, key, config, &window, data_frame_start)?;
+    let sync_corr = if sync_soft.len() >= sync_frame_offset + SYNC_PATTERN_BITS {
+        correlate_sync(
+            &sync_soft[sync_frame_offset..sync_frame_offset + SYNC_PATTERN_BITS],
+            &sync_pattern,
+        )
+    } else {
+        0.0
+    };
+
+    // Extract data soft values at the fixed position
+    let data_soft = compute_data_soft_values(
+        samples,
+        key,
+        config,
+        &window,
+        data_frame_start,
+        coded_bits_count,
+    )?;
+
+    Ok(Some((data_soft, sync_corr)))
+}
+
+/// Find the best sync candidate in the given audio.
+///
+/// Computes const-seed soft values and returns the frame offset and correlation
+/// of the strongest sync candidate, or `None` if no candidate exceeds the
+/// threshold. This is cheaper than [`extract_data_soft`] because it does not
+/// compute data soft values.
+///
+/// Used by [`crate::stream::StreamDetector`] for sub-frame alignment search.
+pub fn find_best_sync(
+    samples: &[f32],
+    key: &WatermarkKey,
+    config: &WatermarkConfig,
+) -> Result<Option<(usize, f32)>> {
+    let frame_size = config.frame_size;
+    if samples.len() < frame_size {
+        return Err(Error::AudioTooShort {
+            needed: frame_size,
+            got: samples.len(),
+        });
+    }
+
+    let hop_size = config.hop_size();
+    let num_frames = (samples.len() - frame_size) / hop_size + 1;
+    let sync_pattern = generate_sync_pattern(key);
+    let frames_per_block = sync::frames_per_block();
+
+    if num_frames < frames_per_block {
+        return Ok(None);
+    }
+
+    let window = hann_window(frame_size);
+    let sync_soft = compute_soft_values_const_seed(samples, key, config, &window, num_frames)?;
+
+    let scan_end = num_frames - frames_per_block;
+    let best = (0..=scan_end)
+        .map(|start| {
+            let corr = correlate_sync(&sync_soft[start..start + SYNC_PATTERN_BITS], &sync_pattern);
+            (start, corr)
+        })
+        .filter(|&(_, corr)| corr > SYNC_THRESHOLD)
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(core::cmp::Ordering::Equal));
+
+    Ok(best)
 }
 
 /// Run Viterbi decode + CRC check on pre-computed soft values.
