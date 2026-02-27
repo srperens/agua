@@ -23,8 +23,9 @@ audiowmark compatibility is NOT required now but the architecture should allow a
 | Parameter | Value |
 |---|---|
 | Frequency range | ~860-4300 Hz (computed from sample_rate) |
-| Bin pairs/frame | 30 |
-| Encoding | Power-law: `mag^(1+/-delta)` |
+| Bin pairs/frame | 60 |
+| Bin spacing | 8 (~375 Hz at 48kHz) |
+| Encoding | Power-law: `exp(delta * |ln(mag)|)` |
 | FFT window | Hann + overlap-add (50% hop) |
 | Frame advance | 512 samples |
 | FEC constraint length K | 15 (16384 states) |
@@ -33,7 +34,7 @@ audiowmark compatibility is NOT required now but the architecture should allow a
 | Coded data bits | 960 (160 data * 6) |
 | Frames/block | 1088 (128 sync + 960 data) |
 | Block duration (48kHz) | ~11.6s |
-| Default strength | 0.02 |
+| Default strength | 0.1 |
 | Payload | 128 bits + CRC-32 (kept) |
 
 ## Phases
@@ -43,7 +44,7 @@ audiowmark compatibility is NOT required now but the architecture should allow a
 **Files:** `agua-core/src/config.rs`, `agua-core/src/patchwork.rs`
 
 Config changes:
-- Change defaults: `num_bin_pairs=30`, `strength=0.02`
+- Change defaults: `num_bin_pairs=60`, `strength=0.1`, `bin_spacing=8`
 - Replace `min_bin`/`max_bin` with `min_freq_hz: f32` (860.0) and `max_freq_hz: f32` (4300.0)
 - Add `effective_bin_range(&self) -> (usize, usize)` computing bins from freq + sample_rate + frame_size
 - Keep `frame_size=1024`, `sample_rate=48000`
@@ -97,7 +98,7 @@ Sync changes:
 
 **Files:** `agua-gst/src/embed.rs`, `agua-cli/src/main.rs`
 
-- GStreamer: update property defaults (`strength=0.02`), replace `min-bin`/`max-bin` props with `min-freq`/`max-freq`, update `num-bin-pairs` default to 30
+- GStreamer: update property defaults (`strength=0.1`), replace `min-bin`/`max-bin` props with `min-freq`/`max-freq`, update `num-bin-pairs` default to 60
 - CLI: update defaults
 
 **No strom changes needed** beyond bumping the agua-gst dependency tag.
@@ -111,12 +112,39 @@ Sync changes:
 - Update `benches/throughput.rs` with new algorithm benchmarks
 - WASM compile test: `cargo build --target wasm32-unknown-unknown -p agua-core`
 
+### Phase 7: WASM Web Demo
+
+**Files:** `agua-web/` (new crate)
+
+- WASM wrapper around StreamDetector (`WasmDetector` via wasm-bindgen)
+- Mic preprocessing: bandpass filter + RMS normalization (`PreProcessor`)
+- Browser UI: real-time mic detection, offline WAV detection, demo player
+- AudioWorklet for sample forwarding, Web Worker for WASM processing
+- Sub-frame alignment search and soft combining for acoustic robustness
+
+**Status:** Complete. Tested on macOS and iPhone (acoustic detection confirmed at strength 0.08+).
+
+### Phase 8: StreamDetector Combining Improvements
+
+**Files:** `agua-core/src/detect.rs`, `agua-core/src/stream.rs`
+
+- Sub-frame alignment search (8 offsets) on first combining block
+- Position-hinted sync candidate selection (`extract_data_soft_near`)
+- Fixed drain to next block start (eliminates ~23s gap between detections)
+- Increased max_combine_blocks from 3 to 5
+- `find_best_sync()` for cheaper sync-only search
+- `extract_data_soft_at()` for extraction at known positions
+
+**Status:** Complete. All 59 tests passing.
+
 ## Phase Dependencies
 
 ```
 Phase 1 (Config + Power-law) ──┐
 Phase 2 (Overlap-add) ─────────┼──> Phase 4 (Integration) ──> Phase 5 (GST+CLI)
 Phase 3 (FEC K=15) ────────────┘                          ──> Phase 6 (Validation)
+                                                          ──> Phase 7 (WASM Web Demo)
+                                                          ──> Phase 8 (Combining Improvements)
 ```
 
 Phases 1, 2, 3 can be developed largely in parallel (they touch different files), with Phase 4 integrating them.

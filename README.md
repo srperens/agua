@@ -20,7 +20,8 @@ Survives lossy compression (MP3, AAC, Opus), 16-bit quantization, and sample rat
 agua/
 ├── agua-core/    Core library crate
 ├── agua-cli/     CLI binary
-└── agua-gst/     GStreamer plugin
+├── agua-gst/     GStreamer plugin
+└── agua-web/     Browser WASM demo (real-time mic detection)
 ```
 
 ## Quick Start
@@ -118,7 +119,7 @@ let config = WatermarkConfig::robust();
 Enable the `parallel` feature for rayon-based multi-threaded embedding and detection:
 
 ```toml
-agua-core = { version = "0.1", features = ["parallel"] }
+agua-core = { version = "0.2", features = ["parallel"] }
 ```
 
 ```rust
@@ -190,7 +191,7 @@ cargo bench --release
 
 Agua uses the **patchwork algorithm** operating in the frequency domain:
 
-1. **Payload encoding**: 128-bit payload + CRC-32 (160 bits) is convolutionally encoded at rate 1/6 (960 coded bits), then interleaved with a 64-bit sync pattern
+1. **Payload encoding**: 128-bit payload + CRC-32 (160 bits) is convolutionally encoded at rate 1/6 (960 coded bits), then interleaved with a 128-bit sync pattern
 2. **Embedding**: Audio is split into 50%-overlapping frames (hop = frame_size/2). Each frame is FFT-transformed, and pseudo-random frequency bin pairs (derived from the key via AES-128 PRNG) are scaled up or down according to the watermark bit
 3. **Detection**: Frames are FFT-transformed and the patchwork statistic (magnitude difference between bin pairs) yields soft bit values. A Viterbi decoder recovers the payload, verified by CRC-32
 
@@ -201,7 +202,7 @@ Minimum audio duration for one full block: ~11.6 seconds at 48kHz (20s recommend
 ```bash
 cargo fmt              # Format code
 cargo clippy --all     # Lint (no warnings allowed)
-cargo test --all       # Run tests (47 passing)
+cargo test --all       # Run tests (59 passing)
 cargo bench --release  # Run benchmarks
 ```
 

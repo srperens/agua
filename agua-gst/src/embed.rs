@@ -69,6 +69,7 @@ mod imp {
         }
     }
 
+    #[derive(Default)]
     struct BufferState {
         /// One StreamEmbedder per audio channel, created on first buffer.
         embedders: Vec<StreamEmbedder>,
@@ -76,18 +77,6 @@ mod imp {
         pending: VecDeque<PendingBuf>,
         initialized: bool,
         offset_remaining_frames: usize,
-    }
-
-    impl Default for BufferState {
-        fn default() -> Self {
-            Self {
-                embedders: Vec::new(),
-                processed: VecDeque::new(),
-                pending: VecDeque::new(),
-                initialized: false,
-                offset_remaining_frames: 0,
-            }
-        }
     }
 
     #[derive(Clone, Debug)]
@@ -298,8 +287,8 @@ mod imp {
                             );
                         }
                         for i in 0..out_frames {
-                            for ch in 0..channels {
-                                state.processed.push_back(channel_outputs[ch][i]);
+                            for output in &channel_outputs {
+                                state.processed.push_back(output[i]);
                             }
                         }
                     }
@@ -475,15 +464,15 @@ mod imp {
                     .map(|_| Vec::with_capacity(embed_frames))
                     .collect();
                 for frame_idx in 0..embed_frames {
-                    for ch in 0..channels {
+                    for (ch, input) in channel_inputs.iter_mut().enumerate() {
                         let idx = frame_idx * channels + ch;
-                        channel_inputs[ch].push(embed_samples[idx]);
+                        input.push(embed_samples[idx]);
                     }
                 }
 
                 let mut channel_outputs: Vec<Vec<f32>> = Vec::with_capacity(channels);
-                for ch in 0..channels {
-                    channel_outputs.push(state.embedders[ch].process(&channel_inputs[ch]));
+                for (embedder, input) in state.embedders.iter_mut().zip(&channel_inputs) {
+                    channel_outputs.push(embedder.process(input));
                 }
 
                 let out_frames = channel_outputs.iter().map(|v| v.len()).min().unwrap_or(0);
@@ -496,8 +485,8 @@ mod imp {
                         );
                     }
                     for i in 0..out_frames {
-                        for ch in 0..channels {
-                            state.processed.push_back(channel_outputs[ch][i]);
+                        for output in &channel_outputs {
+                            state.processed.push_back(output[i]);
                         }
                     }
                 }

@@ -41,18 +41,32 @@
 - [x] Multi-channel support (per-channel embedding with independent frame tracking)
 - [x] No tests yet for agua-gst
 
+### Phase 7: WASM Web Demo — COMPLETE
+- [x] `agua-web` crate added to workspace (wasm-bindgen + web-sys)
+- [x] `WasmDetector` WASM wrapper around StreamDetector
+- [x] `PreProcessor` bandpass filter + RMS normalization for mic input
+- [x] Browser UI: real-time mic detection, offline WAV detection, demo player
+- [x] AudioWorklet + Web Worker architecture
+- [x] Acoustic detection confirmed on iPhone (strength 0.08+) and macOS
+
+### Phase 8: StreamDetector Combining — COMPLETE
+- [x] Sub-frame alignment search (8 offsets) for first combining block
+- [x] `extract_data_soft_near()` with position-hinted candidate selection
+- [x] `extract_data_soft_at()` for extraction at known sync position
+- [x] `find_best_sync()` for cheaper sync-only search
+- [x] Drain fix: drain to start of next block (eliminates ~23s gap)
+- [x] Increased max_combine_blocks from 3 to 5
+- [x] 4 new combining tests (end-to-end, large buffer, resets, soft combine)
+
 ### Outstanding Issues
-- [ ] 2 clippy warnings in `agua-cli` (needless_update in main.rs:188, main.rs:317)
-- [ ] 3 clippy warnings in `agua-gst` (needless_range_loop embed.rs:347, collapsible_if embed.rs:358, needless_range_loop embed.rs:415)
 - [ ] No tests for `agua-gst`
-- [ ] Lossy codec robustness tests not yet validated (require ffmpeg)
 
 ### Test Summary
-- **44/44 tests passing** (40 unit + 4 WAV integration), default features
-- **47/47 tests passing** with `--features parallel` (adds 3 parallel unit tests)
-- 9 additional `#[ignore]` tests (lossy codec round-trips + parameter tuning, require ffmpeg)
+- **59/59 tests passing** (55 unit + 4 WAV integration), default features
+- **62/62 tests passing** with `--features parallel` (adds 3 parallel unit tests)
+- 22 additional `#[ignore]` tests (9 acoustic simulation, 8 lossy codec, 5 parameter tuning)
 - `cargo fmt --all --check` — clean
-- `cargo clippy` — 0 warnings in `agua-core`, 2 in `agua-cli`, 3 in `agua-gst`
+- `cargo clippy` — 0 warnings in `agua-core`
 
 ### Benchmark Results (release build)
 | Benchmark | Time | Real-time ratio |
@@ -79,9 +93,10 @@ Conclusion: **easily real-time capable** — thousands of times faster than real
 ### Workspace Crates
 | Crate | Type | Description |
 |-------|------|-------------|
-| `agua-core` | lib | Core watermarking library (14 modules, 47 tests w/ parallel) |
+| `agua-core` | lib | Core watermarking library (15 modules, 62 tests w/ parallel) |
 | `agua-cli` | bin | CLI for embed/detect on WAV files |
 | `agua-gst` | lib (cdylib) | GStreamer plugin element `aguawatermarkembed` |
+| `agua-web` | lib (cdylib) | Browser WASM demo (real-time mic detection) |
 
 ### Files Implemented
 | Module | Tests | Status |
@@ -89,24 +104,31 @@ Conclusion: **easily real-time capable** — thousands of times faster than real
 | **agua-core** | | |
 | lib.rs | — | Public API re-exports |
 | error.rs | — | Error types |
-| key.rs | 6 | AES-PRNG bin selection |
+| key.rs | 8 | AES-PRNG bin selection |
 | fft.rs | 3 | realfft wrapper |
-| config.rs | — | Configuration + `robust()` |
+| config.rs | 3 | Configuration + `robust()` |
 | payload.rs | 5 | 128-bit payload + CRC |
-| patchwork.rs | 5 | Core embed/detect per frame |
-| codec.rs | 7 | Conv. encoder + Viterbi |
+| patchwork.rs | 4 | Core embed/detect per frame |
+| codec.rs | 6 | Conv. encoder + Viterbi |
 | sync.rs | 5 | Sync pattern + correlation |
 | frame.rs | 3 | Windowing + overlap-add |
 | embed.rs | 3 | Embedding pipeline |
 | detect.rs | 3 | Detection pipeline |
-| stream.rs | 1 | Streaming wrappers |
+| preprocess.rs | 3 | Bandpass filter + RMS normalization |
+| stream.rs | 9 | Streaming wrappers + soft combining |
 | parallel.rs | 3 | Rayon parallel embed/detect (feature-gated) |
 | tests/wav_round_trip.rs | 4 | WAV file integration tests |
+| tests/acoustic_simulation.rs | 9 | Acoustic channel simulation (ignored) |
 | tests/lossy_codec_round_trip.rs | 8 | MP3/AAC/Opus robustness (ignored) |
-| tests/parameter_tuning.rs | 1 | Strength x codec sweep (ignored) |
+| tests/parameter_tuning.rs | 5 | Strength/spacing sweeps (ignored) |
 | benches/throughput.rs | 5+2 | Criterion benchmarks (+ parallel) |
 | **agua-cli** | | |
 | main.rs | — | CLI binary (embed/detect commands) |
 | **agua-gst** | | |
 | lib.rs | — | Plugin registration |
 | embed.rs | — | `AguaWatermarkEmbed` BaseTransform element |
+| **agua-web** | | |
+| src/lib.rs | — | WASM wrapper (`WasmDetector`) |
+| static/app.js | — | Browser UI + offline detection |
+| static/worker.js | — | Web Worker for WASM processing |
+| static/processor.js | — | AudioWorklet sample forwarder |
