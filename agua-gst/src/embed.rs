@@ -44,7 +44,7 @@ mod imp {
                 key,
                 strength: 0.1,
                 frame_size: 1024,
-                num_bin_pairs: 60,
+                num_bin_pairs: 40,
                 min_freq_hz: 860.0,
                 max_freq_hz: 4300.0,
                 bin_spacing: 8,
@@ -129,7 +129,7 @@ mod imp {
                         .blurb("Number of bin pairs per frame")
                         .minimum(1)
                         .maximum(2000)
-                        .default_value(60)
+                        .default_value(40)
                         .build(),
                     glib::ParamSpecFloat::builder("min-freq")
                         .nick("Min frequency")
@@ -187,7 +187,7 @@ mod imp {
                     settings.frame_size = value.get::<u32>().unwrap_or(1024) as usize;
                 }
                 "num-bin-pairs" => {
-                    settings.num_bin_pairs = value.get::<u32>().unwrap_or(60) as usize;
+                    settings.num_bin_pairs = value.get::<u32>().unwrap_or(40) as usize;
                 }
                 "min-freq" => {
                     settings.min_freq_hz = value.get::<f32>().unwrap_or(860.0);

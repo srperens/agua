@@ -14,7 +14,7 @@ Patchwork-based audio watermarking in the FFT domain. Embeds a 128-bit payload i
 
 Key parameters (v0.2):
 - **Frequency range:** 860-4300 Hz (bin range computed dynamically from sample_rate)
-- **Bin pairs/frame:** 60
+- **Bin pairs/frame:** 40
 - **Encoding:** Power-law: `mag^(1+/-delta)` (NOT linear)
 - **FFT window:** Hann + overlap-add with 50% hop (frame_size=1024, hop_size=512)
 - **FEC:** Convolutional code K=15, rate 1/6 (16384 Viterbi states)

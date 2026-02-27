@@ -1,6 +1,6 @@
 
 
-const VERSION = "0.2.1";
+const VERSION = "0.2.2";
 console.log("[app.js] loaded, VERSION=" + VERSION);
 const PROCESS_INTERVAL_MS = 50;
 const MAX_SAMPLES_PER_TICK = 48000; // ~1s at 48kHz — allows catching up if backlog grows

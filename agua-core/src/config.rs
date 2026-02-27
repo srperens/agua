@@ -8,7 +8,7 @@ pub struct WatermarkConfig {
     pub strength: f32,
     /// FFT frame size in samples. Must be power of 2. Default: 1024.
     pub frame_size: usize,
-    /// Number of frequency bin pairs per frame. Default: 60.
+    /// Number of frequency bin pairs per frame. Default: 40.
     pub num_bin_pairs: usize,
     /// Minimum frequency in Hz for watermark embedding. Default: 860.0.
     pub min_freq_hz: f32,
@@ -26,7 +26,7 @@ impl Default for WatermarkConfig {
             sample_rate: 48000,
             strength: 0.1,
             frame_size: 1024,
-            num_bin_pairs: 60,
+            num_bin_pairs: 40,
             min_freq_hz: 860.0,
             max_freq_hz: 4300.0,
             bin_spacing: 8,

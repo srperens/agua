@@ -15,7 +15,7 @@ dependencies = [
 
 [[package]]
 name = "agua-cli"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "agua-core",
  "clap",
@@ -24,7 +24,7 @@ dependencies = [
 
 [[package]]
 name = "agua-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aes",
  "cipher 0.5.0",
@@ -38,7 +38,7 @@ dependencies = [
 
 [[package]]
 name = "agua-gst"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "agua-core",
  "gstreamer",
@@ -49,7 +49,7 @@ dependencies = [
 
 [[package]]
 name = "agua-web"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "agua-core",
  "wasm-bindgen",

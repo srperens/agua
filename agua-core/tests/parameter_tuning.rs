@@ -501,14 +501,14 @@ fn spacing_comparison() {
             num_bin_pairs: 30,
         },
         Profile {
-            name: "agua default     (s=8, p=60)",
+            name: "agua default     (s=8, p=40)",
             bin_spacing: 8,
-            num_bin_pairs: 60,
+            num_bin_pairs: 40,
         },
         Profile {
-            name: "hybrid           (s=4, p=60)",
+            name: "hybrid           (s=4, p=40)",
             bin_spacing: 4,
-            num_bin_pairs: 60,
+            num_bin_pairs: 40,
         },
         Profile {
             name: "wide sparse      (s=8, p=30)",
@@ -919,6 +919,193 @@ fn bin_spacing_sweep() {
         let start = row * strengths_len;
         for col in 0..strengths_len {
             print!("{:<12}", cells[start + col]);
+        }
+        println!();
+    }
+}
+
+/// Compare num_bin_pairs=30 vs 60 across strength, digital clean, lossy codecs,
+/// and simulated acoustic channel.
+///
+/// Tests: (1) digital clean, (2) MP3 128k, (3) AAC 128k, (4) acoustic simulation
+#[test]
+#[ignore]
+fn bin_pairs_30_vs_60() {
+    use agua_core::PreProcessor;
+
+    let sample_rate = 48000u32;
+    let num_samples = 48000 * 25; // 25s
+    let key = WatermarkKey::new(&[42u8; 16]).unwrap();
+    let payload = Payload::new([
+        0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC,
+        0xBA, 0x98,
+    ]);
+
+    let bin_pairs_options: &[usize] = &[20, 30, 40, 50, 60];
+    let strengths: &[f32] = &[0.03, 0.05, 0.08, 0.10];
+
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    println!();
+    println!("=== num_bin_pairs comparison ===");
+    println!();
+
+    // --- Digital clean ---
+    println!("--- Digital clean (one-shot detect) ---");
+    print!("{:<12}", "bins\\str");
+    for &s in strengths {
+        print!("{:<12}", format!("{:.2}", s));
+    }
+    println!();
+
+    for &nbp in bin_pairs_options {
+        print!("{:<12}", nbp);
+        for &strength in strengths {
+            let config = WatermarkConfig {
+                strength,
+                num_bin_pairs: nbp,
+                sample_rate,
+                ..WatermarkConfig::default()
+            };
+
+            let mut audio = make_test_audio(num_samples, sample_rate);
+            agua_core::embed(&mut audio, &payload, &key, &config).unwrap();
+
+            let cell = match agua_core::detect(&audio, &key, &config) {
+                Ok(r) if !r.is_empty() && r[0].payload == payload => {
+                    format!("{:.4}", r[0].confidence)
+                }
+                Ok(_) => "WRONG".to_string(),
+                Err(_) => "FAIL".to_string(),
+            };
+            print!("{:<12}", cell);
+        }
+        println!();
+    }
+
+    // --- MP3 128k ---
+    println!();
+    println!("--- MP3 128k ---");
+    print!("{:<12}", "bins\\str");
+    for &s in strengths {
+        print!("{:<12}", format!("{:.2}", s));
+    }
+    println!();
+
+    for &nbp in bin_pairs_options {
+        print!("{:<12}", nbp);
+        for &strength in strengths {
+            let config = WatermarkConfig {
+                strength,
+                num_bin_pairs: nbp,
+                sample_rate,
+                ..WatermarkConfig::default()
+            };
+
+            let mut audio = make_test_audio(num_samples, sample_rate);
+            agua_core::embed(&mut audio, &payload, &key, &config).unwrap();
+
+            let input_wav = dir.path().join(format!("bp{nbp}_s{strength}_mp3.wav"));
+            let output_wav = dir.path().join(format!("bp{nbp}_s{strength}_mp3_out.wav"));
+            write_wav_i16(&input_wav, &audio, sample_rate);
+
+            let cell = if ffmpeg_round_trip(&input_wav, &output_wav, "libmp3lame", "128k") {
+                let decoded = read_wav_f32(&output_wav);
+                match agua_core::detect(&decoded, &key, &config) {
+                    Ok(r) if !r.is_empty() && r[0].payload == payload => {
+                        format!("{:.4}", r[0].confidence)
+                    }
+                    Ok(_) => "WRONG".to_string(),
+                    Err(_) => "FAIL".to_string(),
+                }
+            } else {
+                "NO_FF".to_string()
+            };
+            print!("{:<12}", cell);
+        }
+        println!();
+    }
+
+    // --- AAC 128k ---
+    println!();
+    println!("--- AAC 128k ---");
+    print!("{:<12}", "bins\\str");
+    for &s in strengths {
+        print!("{:<12}", format!("{:.2}", s));
+    }
+    println!();
+
+    for &nbp in bin_pairs_options {
+        print!("{:<12}", nbp);
+        for &strength in strengths {
+            let config = WatermarkConfig {
+                strength,
+                num_bin_pairs: nbp,
+                sample_rate,
+                ..WatermarkConfig::default()
+            };
+
+            let mut audio = make_test_audio(num_samples, sample_rate);
+            agua_core::embed(&mut audio, &payload, &key, &config).unwrap();
+
+            let input_wav = dir.path().join(format!("bp{nbp}_s{strength}_aac.wav"));
+            let output_wav = dir.path().join(format!("bp{nbp}_s{strength}_aac_out.wav"));
+            write_wav_i16(&input_wav, &audio, sample_rate);
+
+            let cell = if ffmpeg_round_trip(&input_wav, &output_wav, "aac", "128k") {
+                let decoded = read_wav_f32(&output_wav);
+                match agua_core::detect(&decoded, &key, &config) {
+                    Ok(r) if !r.is_empty() && r[0].payload == payload => {
+                        format!("{:.4}", r[0].confidence)
+                    }
+                    Ok(_) => "WRONG".to_string(),
+                    Err(_) => "FAIL".to_string(),
+                }
+            } else {
+                "NO_FF".to_string()
+            };
+            print!("{:<12}", cell);
+        }
+        println!();
+    }
+
+    // --- Acoustic simulation ---
+    println!();
+    println!("--- Acoustic simulation (lowpass + noise + jitter) ---");
+    print!("{:<12}", "bins\\str");
+    for &s in strengths {
+        print!("{:<12}", format!("{:.2}", s));
+    }
+    println!();
+
+    for &nbp in bin_pairs_options {
+        print!("{:<12}", nbp);
+        for &strength in strengths {
+            let config = WatermarkConfig {
+                strength,
+                num_bin_pairs: nbp,
+                sample_rate,
+                ..WatermarkConfig::default()
+            };
+
+            let mut audio = make_test_audio(num_samples, sample_rate);
+            agua_core::embed(&mut audio, &payload, &key, &config).unwrap();
+
+            // Simulate acoustic channel
+            let mut degraded = lowpass_filter(&audio, sample_rate, 8000.0, 127);
+            add_white_noise(&mut degraded, 20.0);
+            let mut degraded = resample_jitter(&degraded, 1.001);
+            let mut preprocessor = PreProcessor::new(sample_rate);
+            preprocessor.process(&mut degraded);
+
+            let cell = match agua_core::detect(&degraded, &key, &config) {
+                Ok(r) if !r.is_empty() && r[0].payload == payload => {
+                    format!("{:.4}", r[0].confidence)
+                }
+                Ok(_) => "WRONG".to_string(),
+                Err(_) => "FAIL".to_string(),
+            };
+            print!("{:<12}", cell);
         }
         println!();
     }

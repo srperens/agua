@@ -44,7 +44,7 @@ audiowmark compatibility is NOT required now but the architecture should allow a
 **Files:** `agua-core/src/config.rs`, `agua-core/src/patchwork.rs`
 
 Config changes:
-- Change defaults: `num_bin_pairs=60`, `strength=0.1`, `bin_spacing=8`
+- Change defaults: `num_bin_pairs=40`, `strength=0.1`, `bin_spacing=8`
 - Replace `min_bin`/`max_bin` with `min_freq_hz: f32` (860.0) and `max_freq_hz: f32` (4300.0)
 - Add `effective_bin_range(&self) -> (usize, usize)` computing bins from freq + sample_rate + frame_size
 - Keep `frame_size=1024`, `sample_rate=48000`
