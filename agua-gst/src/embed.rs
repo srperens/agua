@@ -74,19 +74,20 @@ mod imp {
         /// One StreamEmbedder per audio channel, created on first buffer.
         embedders: Vec<StreamEmbedder>,
         processed: VecDeque<f32>,
-        pending: VecDeque<PendingBuf>,
+        /// Pending output buffer sizes (interleaved samples).
+        pending_sizes: VecDeque<usize>,
         initialized: bool,
         offset_remaining_frames: usize,
-    }
-
-    #[derive(Clone, Debug)]
-    struct PendingBuf {
-        size_samples: usize,
-        pts: Option<gst::ClockTime>,
-        duration: Option<gst::ClockTime>,
-        flags: gst::BufferFlags,
-        offset: Option<u64>,
-        offset_end: Option<u64>,
+        /// PTS of the first input buffer in the current segment.
+        base_pts: Option<gst::ClockTime>,
+        /// Running count of interleaved output samples produced so far.
+        total_output_samples: u64,
+        /// Cached from negotiated caps for PTS math.
+        sample_rate: u32,
+        /// Cached from negotiated caps for PTS math.
+        num_channels: u32,
+        /// Set on discont/init so the first output buffer carries DISCONT.
+        needs_discont: bool,
     }
 
     #[glib::object_subclass]
@@ -265,11 +266,6 @@ mod imp {
 
         fn sink_event(&self, event: gst::Event) -> bool {
             if let gst::EventView::Eos(_) = event.view() {
-                let settings = self.settings.lock().unwrap();
-                let sample_rate = settings.sample_rate;
-                let num_channels = settings.channels as usize;
-                drop(settings);
-
                 let mut state = self.buffer_state.lock().unwrap();
                 if state.initialized && !state.embedders.is_empty() {
                     let channels = state.embedders.len();
@@ -298,18 +294,7 @@ mod imp {
                     // it now so generate_output can drain it.
                     let remaining = state.processed.len();
                     if remaining > 0 {
-                        let ch = num_channels.max(1);
-                        let frames = remaining / ch;
-                        let ns = (frames as u64).saturating_mul(gst::ClockTime::SECOND.nseconds())
-                            / sample_rate as u64;
-                        state.pending.push_back(PendingBuf {
-                            size_samples: remaining,
-                            pts: None,
-                            duration: Some(gst::ClockTime::from_nseconds(ns)),
-                            flags: gst::BufferFlags::empty(),
-                            offset: None,
-                            offset_end: None,
-                        });
+                        state.pending_sizes.push_back(remaining);
                     }
                 }
             }
@@ -320,9 +305,14 @@ mod imp {
             let mut state = self.buffer_state.lock().unwrap();
             state.embedders.clear();
             state.processed.clear();
-            state.pending.clear();
+            state.pending_sizes.clear();
             state.initialized = false;
             state.offset_remaining_frames = 0;
+            state.base_pts = None;
+            state.total_output_samples = 0;
+            state.sample_rate = 0;
+            state.num_channels = 0;
+            state.needs_discont = false;
             Ok(())
         }
 
@@ -338,8 +328,9 @@ mod imp {
                 if upstream_ok {
                     let (live, min, max) = peer_query.result();
                     let settings = self.settings.lock().unwrap();
+                    let hop_size = settings.frame_size / 2;
                     let our_latency = gst::ClockTime::from_nseconds(
-                        (settings.frame_size as u64)
+                        (hop_size as u64)
                             .saturating_mul(gst::ClockTime::SECOND.nseconds())
                             / settings.sample_rate as u64,
                     );
@@ -408,9 +399,12 @@ mod imp {
             if is_discont {
                 state.embedders.clear();
                 state.processed.clear();
-                state.pending.clear();
+                state.pending_sizes.clear();
                 state.initialized = false;
                 state.offset_remaining_frames = 0;
+                state.base_pts = None;
+                state.total_output_samples = 0;
+                state.needs_discont = true;
             }
 
             if !state.initialized {
@@ -442,7 +436,14 @@ mod imp {
                     (settings.offset_seconds * settings.sample_rate as f32).round() as usize;
                 state.offset_remaining_frames = offset_frames;
                 state.embedders = embedders;
+                state.sample_rate = settings.sample_rate;
+                state.num_channels = settings.channels;
                 state.initialized = true;
+            }
+
+            // Capture base_pts from the first buffer in this segment.
+            if state.base_pts.is_none() {
+                state.base_pts = inbuf.pts();
             }
 
             let frames_in_buf = sample_count / channels;
@@ -492,23 +493,15 @@ mod imp {
                 }
             }
 
-            // Always create PendingBuf matching input buffer size so downstream
-            // sees the same buffer rhythm as upstream (even flow).
-            state.pending.push_back(PendingBuf {
-                size_samples: sample_count,
-                pts: inbuf.pts(),
-                duration: inbuf.duration(),
-                flags: inbuf.flags(),
-                offset: Some(inbuf.offset()),
-                offset_end: Some(inbuf.offset_end()),
-            });
+            // Track output buffer size to match upstream rhythm.
+            state.pending_sizes.push_back(sample_count);
 
             gst::debug!(
                 gst::CAT_DEFAULT,
                 obj = self.obj(),
                 "submit_input_buffer: in_samples={}, pending_bufs={}, processed_samples={}, offset_remaining_frames={}",
                 sample_count,
-                state.pending.len(),
+                state.pending_sizes.len(),
                 state.processed.len(),
                 state.offset_remaining_frames
             );
@@ -518,8 +511,8 @@ mod imp {
 
         fn generate_output(&self) -> Result<GenerateOutputSuccess, gst::FlowError> {
             let mut state = self.buffer_state.lock().unwrap();
-            let next = match state.pending.front() {
-                Some(p) => p.clone(),
+            let needed = match state.pending_sizes.front().copied() {
+                Some(n) => n,
                 None => {
                     gst::debug!(
                         gst::CAT_DEFAULT,
@@ -530,19 +523,36 @@ mod imp {
                 }
             };
 
-            if state.processed.len() < next.size_samples {
+            if state.processed.len() < needed {
                 gst::debug!(
                     gst::CAT_DEFAULT,
                     obj = self.obj(),
                     "generate_output: waiting (processed_samples={}, needed={})",
                     state.processed.len(),
-                    next.size_samples
+                    needed
                 );
                 return Ok(GenerateOutputSuccess::NoOutput);
             }
 
+            let num_channels = state.num_channels.max(1) as u64;
+            let sample_rate = state.sample_rate.max(1) as u64;
+            let nsec = gst::ClockTime::SECOND.nseconds();
+
+            // Compute PTS from base + running sample counter.
+            // Split into seconds + remainder to avoid u64 overflow on long streams.
+            let output_frames = needed as u64 / num_channels;
+            let frame_offset = state.total_output_samples / num_channels;
+            let pts = state.base_pts.map(|base| {
+                let secs = frame_offset / sample_rate;
+                let rem = frame_offset % sample_rate;
+                base + gst::ClockTime::from_nseconds(secs * nsec + rem * nsec / sample_rate)
+            });
+            let duration = Some(gst::ClockTime::from_nseconds(
+                output_frames * nsec / sample_rate,
+            ));
+
             let mut outbuf =
-                gst::Buffer::with_size(next.size_samples * 4).map_err(|_| gst::FlowError::Error)?;
+                gst::Buffer::with_size(needed * 4).map_err(|_| gst::FlowError::Error)?;
             {
                 let outbuf_mut = outbuf.get_mut().unwrap();
                 let mut map = outbuf_mut
@@ -552,30 +562,32 @@ mod imp {
                 let out_samples: &mut [f32] = unsafe {
                     std::slice::from_raw_parts_mut(
                         out_data.as_mut_ptr() as *mut f32,
-                        next.size_samples,
+                        needed,
                     )
                 };
-                for sample in out_samples.iter_mut().take(next.size_samples) {
+                for sample in out_samples.iter_mut() {
                     *sample = state.processed.pop_front().unwrap();
                 }
                 drop(map);
-                outbuf_mut.set_flags(next.flags);
-                outbuf_mut.set_pts(next.pts);
-                outbuf_mut.set_duration(next.duration);
-                if let Some(off) = next.offset {
-                    outbuf_mut.set_offset(off);
+
+                if state.needs_discont {
+                    outbuf_mut.set_flags(gst::BufferFlags::DISCONT);
+                    state.needs_discont = false;
                 }
-                if let Some(off) = next.offset_end {
-                    outbuf_mut.set_offset_end(off);
-                }
+                outbuf_mut.set_pts(pts);
+                outbuf_mut.set_duration(duration);
+                outbuf_mut.set_offset(frame_offset);
+                outbuf_mut.set_offset_end(frame_offset + output_frames);
             }
 
-            state.pending.pop_front();
+            state.total_output_samples += needed as u64;
+            state.pending_sizes.pop_front();
             gst::debug!(
                 gst::CAT_DEFAULT,
                 obj = self.obj(),
-                "generate_output: produced buffer (samples={})",
-                next.size_samples
+                "generate_output: produced buffer (samples={}, pts={:?})",
+                needed,
+                pts
             );
             Ok(GenerateOutputSuccess::Buffer(outbuf))
         }
