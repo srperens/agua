@@ -4,7 +4,7 @@
  * Each process() call receives 128 samples (one render quantum).
  * We copy and post them to avoid transferring the shared buffer.
  */
-const PROCESSOR_VERSION = "0.8.0";
+const PROCESSOR_VERSION = "0.2.0";
 console.log("[processor.js] loaded, VERSION=" + PROCESSOR_VERSION);
 
 class SampleForwarder extends AudioWorkletProcessor {

@@ -1,6 +1,6 @@
 
 
-const VERSION = "0.8.0";
+const VERSION = "0.2.0";
 console.log("[app.js] loaded, VERSION=" + VERSION);
 const PROCESS_INTERVAL_MS = 50;
 const MAX_SAMPLES_PER_TICK = 48000; // ~1s at 48kHz — allows catching up if backlog grows
@@ -33,6 +33,7 @@ const stopBtn = document.getElementById("stop-btn");
 const statusEl = document.getElementById("status");
 const statusDot = document.getElementById("status-dot");
 const payloadEl = document.getElementById("payload");
+const payloadAsciiEl = document.getElementById("payload-ascii");
 const confidenceEl = document.getElementById("confidence");
 const confidenceBar = document.getElementById("confidence-bar");
 const bufferBar = document.getElementById("buffer-bar");
@@ -71,7 +72,7 @@ document.getElementById("version-tag").textContent = `v${VERSION}`;
 
 clearLogBtn.addEventListener("click", () => {
   detectionLog.innerHTML = "";
-  payloadEl.textContent = "\u2014";
+  setPayloadDisplay(null);
   confidenceEl.textContent = "\u2014";
   confidenceBar.style.width = "0%";
 });
@@ -134,6 +135,7 @@ async function runOfflineDetect(arrayBuf) {
 
     let detected = null;
     let confidence = 0;
+    let detectionCount = 0;
     const totalChunks = Math.ceil(channelData.length / chunkSize);
     console.log("[offline] processing", totalChunks, "chunks of", chunkSize, "samples");
     for (let i = 0; i < channelData.length; i += chunkSize) {
@@ -161,19 +163,19 @@ async function runOfflineDetect(arrayBuf) {
       if (res.payload) {
         detected = res.payload;
         confidence = res.confidence || 0;
-        console.log("[offline] DETECTED:", detected, "confidence:", confidence);
-        break;
+        detectionCount++;
+        console.log("[offline] DETECTED #" + detectionCount + ":", detected, "confidence:", confidence);
+        addDetection(detected + " (offline)", confidence);
       }
     }
-    console.log("[offline] loop done, detected=", detected);
+    console.log("[offline] loop done, detections=", detectionCount);
     offlineWorker.terminate();
     if (detected) {
-      offlineStatus.textContent = `Detected payload ${detected} (confidence ${(confidence * 100).toFixed(1)}%)`;
-      payloadEl.textContent = detected;
+      offlineStatus.textContent = `Detected ${detectionCount}× payload ${detected} (confidence ${(confidence * 100).toFixed(1)}%)`;
+      setPayloadDisplay(detected);
       confidenceEl.textContent = (confidence * 100).toFixed(1) + "%";
       confidenceBar.style.width = Math.min(confidence * 100, 100).toFixed(1) + "%";
       setStatus("Watermark detected (offline)", "detected");
-      addDetection(detected, confidence);
     } else {
       offlineStatus.textContent = "No watermark detected (offline)";
     }
@@ -287,6 +289,28 @@ playerSelect.addEventListener("change", () => {
 function setStatus(text, state) {
   statusEl.textContent = text;
   statusDot.className = "status-dot " + state;
+}
+
+function hexToAscii(hex) {
+  if (!hex || hex.length % 2 !== 0) return null;
+  let out = "";
+  for (let i = 0; i < hex.length; i += 2) {
+    const byte = Number.parseInt(hex.slice(i, i + 2), 16);
+    if (Number.isNaN(byte)) return null;
+    out += (byte >= 32 && byte <= 126) ? String.fromCharCode(byte) : ".";
+  }
+  return out;
+}
+
+function setPayloadDisplay(hex) {
+  if (!hex) {
+    payloadEl.textContent = "\u2014";
+    payloadAsciiEl.textContent = "\u2014";
+    return;
+  }
+  payloadEl.textContent = hex;
+  const ascii = hexToAscii(hex);
+  payloadAsciiEl.textContent = ascii ?? "\u2014";
 }
 
 function addDetection(payload, confidence) {
@@ -464,7 +488,7 @@ async function start() {
           }
         }
         if (msg.payload) {
-          payloadEl.textContent = msg.payload;
+          setPayloadDisplay(msg.payload);
           const confidence = msg.confidence ?? 0;
           confidenceEl.textContent = (confidence * 100).toFixed(1) + "%";
           confidenceBar.style.width = Math.min(confidence * 100, 100).toFixed(1) + "%";

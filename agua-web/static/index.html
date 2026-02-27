@@ -133,6 +133,11 @@
       color: var(--accent);
       min-height: 1.4em;
     }
+    .value.payload-ascii {
+      font-size: 1rem;
+      color: var(--text);
+      min-height: 1.3em;
+    }
 
     .progress-container {
       background: var(--bg);
@@ -224,6 +229,8 @@
   <div class="card">
     <div class="label">Detected payload</div>
     <div id="payload" class="value payload">&mdash;</div>
+    <div class="label" style="margin-top: 0.5rem;">Detected payload (ASCII)</div>
+    <div id="payload-ascii" class="value payload-ascii">&mdash;</div>
 
     <div class="label" style="margin-top: 0.75rem;">Confidence</div>
     <div class="stats" style="margin-bottom: 0.25rem;">
@@ -297,6 +304,6 @@
     <div id="detection-log" class="log-section"></div>
   </div>
 
-  <script type="module" src="app.js?v=0.8.0"></script>
+  <script type="module" src="app.js?v=0.2.0"></script>
 </body>
 </html>
