@@ -160,7 +160,102 @@ fn lossy_round_trip_test(codec: &str, bitrate: &str, codec_name: &str) {
     }
 }
 
-// --- MP3 tests ---
+/// Run a multi-generation encode/decode test: embed once, then re-encode N times.
+///
+/// Simulates an attacker (or careless pipeline) that transcodes the audio
+/// through a lossy codec multiple times trying to degrade the watermark.
+fn multi_generation_test(codec: &str, bitrate: &str, codec_name: &str, generations: usize) {
+    let config = WatermarkConfig::robust();
+    let key = WatermarkKey::new(&[42u8; 16]).unwrap();
+    let payload = Payload::new([
+        0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC,
+        0xBA, 0x98,
+    ]);
+
+    let num_samples = 48000 * 25;
+    let mut audio = make_test_audio(num_samples, config.sample_rate);
+
+    agua_core::embed(&mut audio, &payload, &key, &config).unwrap();
+
+    let dir = tempfile::tempdir().expect("failed to create tempdir");
+
+    // Write initial watermarked WAV
+    let mut current_wav = dir.path().join("gen_0.wav");
+    write_wav_i16(&current_wav, &audio, config.sample_rate);
+
+    // Re-encode through the lossy codec N times
+    for g in 1..=generations {
+        let next_wav = dir.path().join(format!("gen_{g}.wav"));
+        ffmpeg_round_trip(&current_wav, &next_wav, codec, bitrate);
+        current_wav = next_wav;
+    }
+
+    // Try to detect watermark after N generations
+    let (decoded_samples, sr) = read_wav_f32(&current_wav);
+    assert_eq!(sr, config.sample_rate);
+
+    let result = agua_core::detect(&decoded_samples, &key, &config);
+    match result {
+        Ok(results) => {
+            assert_eq!(
+                results[0].payload, payload,
+                "{codec_name} @ {bitrate} × {generations}: detected but payload mismatch"
+            );
+            println!(
+                "{codec_name} @ {bitrate} × {generations} generations: PASS (confidence: {:.4})",
+                results[0].confidence
+            );
+        }
+        Err(_) => {
+            println!(
+                "{codec_name} @ {bitrate} × {generations} generations: FAIL (not detected)"
+            );
+            panic!(
+                "{codec_name} @ {bitrate}: watermark not detected after {generations} generations"
+            );
+        }
+    }
+}
+
+// --- Multi-generation tests ---
+
+#[test]
+#[ignore]
+fn mp3_128k_5_generations() {
+    multi_generation_test("libmp3lame", "128k", "MP3", 5);
+}
+
+#[test]
+#[ignore]
+fn mp3_128k_10_generations() {
+    multi_generation_test("libmp3lame", "128k", "MP3", 10);
+}
+
+#[test]
+#[ignore]
+fn aac_128k_5_generations() {
+    multi_generation_test("aac", "128k", "AAC", 5);
+}
+
+#[test]
+#[ignore]
+fn aac_128k_10_generations() {
+    multi_generation_test("aac", "128k", "AAC", 10);
+}
+
+#[test]
+#[ignore]
+fn opus_128k_5_generations() {
+    multi_generation_test("libopus", "128k", "Opus", 5);
+}
+
+#[test]
+#[ignore]
+fn opus_128k_10_generations() {
+    multi_generation_test("libopus", "128k", "Opus", 10);
+}
+
+// --- Single-generation tests (MP3) ---
 
 #[test]
 #[ignore]
